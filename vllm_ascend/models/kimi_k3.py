@@ -17,14 +17,16 @@
 """Native multimodal Kimi K3 model for vLLM-Ascend."""
 
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
-from typing import Annotated, Any, Literal, cast
+from functools import partial
+from typing import Annotated, Any, Callable, Literal, cast
 
 import numpy as np
 import torch
 import torch_npu
 from torch import nn
+from torch.nn import functional as F
 from transformers import BatchFeature
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -87,8 +89,13 @@ from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalKwargsItems,
     NestedTensors,
+    VisionChunkImage,
 )
-from vllm.multimodal.parse import ImageProcessorItems, ImageSize, MultiModalDataItems
+from vllm.multimodal.parse import (
+    ImageSize,
+    MultiModalDataItems,
+    VisionChunkProcessorItems,
+)
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
@@ -123,6 +130,10 @@ if HAS_TRITON:
     from vllm_ascend.ops.triton.kimi_k3.attention_residual import apply_attn_res as triton_apply_attn_res
 
     apply_attn_res = triton_apply_attn_res
+_VERL_PACKED_LOCAL_MARKER = ".__verl_packed_local__."
+_KIMI_IMAGE_PLACEHOLDER = (
+    "<|media_begin|>image<|media_content|><|media_pad|><|media_end|>"
+)
 
 
 def _routed_latent_quant_config(
@@ -138,27 +149,124 @@ def _resolve_packed_expert_weight_name(
     name: str,
     params_dict: Mapping[str, object],
 ) -> str:
-    """Map packed checkpoint weights to the parameter name used by the scheme."""
-    if name in params_dict or not name.endswith("_weight"):
-        return name
-    packed_name = f"{name}_packed"
-    return packed_name if packed_name in params_dict else name
+    """Map a checkpoint expert name to the live vLLM parameter name.
 
+    vLLM 0.26 moved the owned expert parameters below the MoERunner's
+    ``routed_experts`` submodule.  Quantization schemes may additionally use
+    the historical ``*_weight_packed`` suffix.  Resolve both layouts from the
+    actual parameter table so online reload never relies on a version guess.
+    """
+    candidates = [name]
+    if name.endswith("_weight"):
+        candidates.append(f"{name}_packed")
 
-def _is_vit_use_data_parallel(num_heads: int) -> bool:
-    """Keep vision TP fallback compatible with the vLLM release branch."""
-    if not vllm_version_is("0.25.1"):
-        return is_vit_use_data_parallel(num_heads)
-
-    # TODO: Remove this branch when vLLM 0.25.1 support is dropped.
-    if num_heads % get_tensor_model_parallel_world_size() != 0:
-        logger.warning_once(
-            "The number of vision attention heads is not divisible by "
-            "the tensor parallel size. Falling back to data parallelism "
-            "for the vision encoder."
+    if ".experts." in name and ".experts.routed_experts." not in name:
+        routed_name = name.replace(
+            ".experts.",
+            ".experts.routed_experts.",
+            1,
         )
-        return True
-    return is_vit_use_data_parallel()
+        candidates.append(routed_name)
+        if routed_name.endswith("_weight"):
+            candidates.append(f"{routed_name}_packed")
+
+    for candidate in candidates:
+        if candidate in params_dict:
+            return candidate
+    return name
+
+
+def _parse_verl_packed_local_name(name: str) -> tuple[str, int | None]:
+    """Return the physical packed parameter name and global expert offset."""
+    if _VERL_PACKED_LOCAL_MARKER not in name:
+        return name, None
+    base_name, start_text = name.rsplit(_VERL_PACKED_LOCAL_MARKER, 1)
+    if not start_text.isdecimal():
+        raise ValueError(
+            f"Invalid Kimi packed-local expert offset in weight name: {name}"
+        )
+    return base_name, int(start_text)
+
+
+def _kimi_hf_sigmoid_topk(
+    *,
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    e_score_correction_bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reproduce the FSDPTurbo/HF Kimi router arithmetic exactly."""
+    del hidden_states
+    scores = gating_output.float().sigmoid()
+    scores_for_choice = scores + e_score_correction_bias.float().unsqueeze(0)
+    topk_ids = torch.topk(
+        scores_for_choice,
+        k=topk,
+        dim=-1,
+        sorted=False,
+    ).indices
+    topk_weights = scores.gather(1, topk_ids)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1e-20)
+    return topk_weights.float(), topk_ids
+
+
+class _NpuCanonicalND(torch.autograd.Function):
+    """Canonicalize an NPU tensor format without disconnecting gradients."""
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
+        ctx.original_format = torch_npu.get_npu_format(tensor)
+        return torch_npu.npu_format_cast(tensor, 2)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor]:
+        return (torch_npu.npu_format_cast(grad_output, ctx.original_format),)
+
+
+def _canonical_nd(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type != "npu":
+        return tensor
+    if torch.is_grad_enabled() and tensor.requires_grad:
+        return _NpuCanonicalND.apply(tensor)
+    return torch_npu.npu_format_cast(tensor, 2)
+
+
+def _apply_training_rope(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match the MoonViT NPU RoPE used by the actor/reference model."""
+    cos = (
+        freqs_cis.unsqueeze(-2)
+        .real.to(torch.float32)
+        .repeat_interleave(2, dim=-1)
+        .contiguous()
+    )
+    sin = (
+        freqs_cis.unsqueeze(-2)
+        .imag.to(torch.float32)
+        .repeat_interleave(2, dim=-1)
+        .contiguous()
+    )
+    query = torch_npu.npu_rotary_mul(
+        query.float(),
+        cos,
+        sin,
+        rotary_mode="interleave",
+    ).type_as(query)
+    key = torch_npu.npu_rotary_mul(
+        key.float(),
+        cos,
+        sin,
+        rotary_mode="interleave",
+    ).type_as(key)
+    return query, key
 
 
 def _move_module_to_device(
@@ -265,7 +373,6 @@ class KimiK3ProcessingInfo(BaseProcessingInfo):
         else:
             self.media_token_id = config_token_id
         self.hf_config.media_placeholder_token_id = self.media_token_id
-        self.media_token = tokenizer.decode(self.media_token_id)
         self.image_processor = image_processor
         self.hf_processor = KimiK3Processor(image_processor, tokenizer)
         self.media_tokens_calculator = image_processor.media_tokens_calculator
@@ -278,7 +385,9 @@ class KimiK3ProcessingInfo(BaseProcessingInfo):
         return self.ctx.get_hf_config(KimiK3Config)
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"image": None}
+        # Kimi's renderer and verl adapter both normalize images to vLLM's
+        # unified vision-chunk modality.
+        return {"vision_chunk": None}
 
     @classmethod
     def get_max_image_size(
@@ -322,10 +431,7 @@ class KimiK3ProcessingInfo(BaseProcessingInfo):
 
 class KimiK3DummyInputsBuilder(BaseDummyInputsBuilder[KimiK3ProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
-        return self.info.get_hf_config().image_placeholder * mm_counts.get(
-            "image",
-            0,
-        )
+        return _KIMI_IMAGE_PLACEHOLDER * mm_counts.get("vision_chunk", 0)
 
     def get_dummy_mm_data(
         self,
@@ -344,15 +450,19 @@ class KimiK3DummyInputsBuilder(BaseDummyInputsBuilder[KimiK3ProcessingInfo]):
         )
         image_overrides = cast(
             ImageDummyOptions | None,
-            mm_options.get("image"),
+            mm_options.get("vision_chunk"),
+        )
+        images = self._get_dummy_images(
+            height=max_size.height,
+            width=max_size.width,
+            num_images=mm_counts.get("vision_chunk", 0),
+            overrides=image_overrides,
         )
         return {
-            "image": self._get_dummy_images(
-                height=max_size.height,
-                width=max_size.width,
-                num_images=mm_counts.get("image", 0),
-                overrides=image_overrides,
-            ),
+            "vision_chunk": [
+                VisionChunkImage(type="image", image=image)
+                for image in images
+            ],
         }
 
 
@@ -367,11 +477,11 @@ class KimiK3MultiModalProcessor(BaseMultiModalProcessor[KimiK3ProcessingInfo]):
         grid_sizes = grid_thws.prod(-1)
         return {
             "pixel_values": MultiModalFieldConfig.flat_from_sizes(
-                "image",
+                "vision_chunk",
                 grid_sizes,
             ),
             "grid_thws": MultiModalFieldConfig.batched(
-                "image",
+                "vision_chunk",
                 keep_on_cpu=True,
             ),
         }
@@ -383,8 +493,9 @@ class KimiK3MultiModalProcessor(BaseMultiModalProcessor[KimiK3ProcessingInfo]):
         mm_kwargs: Mapping[str, object],
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        # Always route through KimiK3Processor, which wraps bare images into
-        # the media dictionaries expected by the checkpoint processor.
+        # vision_chunk is not handled by vLLM's generic MM-only helper.
+        # Declaring this override selects the text+MM path, which calls the
+        # Kimi processor with vision_chunks intact.
         return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
 
     def _hf_processor_applies_updates(
@@ -410,25 +521,45 @@ class KimiK3MultiModalProcessor(BaseMultiModalProcessor[KimiK3ProcessingInfo]):
     ) -> Sequence[PromptUpdate]:
         del hf_processor_mm_kwargs, out_mm_kwargs
         media_token_id = self.info.media_token_id
-        media_token = self.info.media_token
-        image_placeholder = self.info.get_hf_config().image_placeholder
+        tokenizer = self.info.get_tokenizer()
+        target = (
+            tokenizer.encode(
+                "<|media_begin|>image<|media_content|>",
+                add_special_tokens=False,
+            )
+            + [media_token_id]
+            + tokenizer.encode("<|media_end|>", add_special_tokens=False)
+        )
 
-        def replacement(item_idx: int) -> PromptUpdateDetails[str]:
-            images = mm_items.get_items("image", (ImageProcessorItems,))
-            image = images.get(item_idx)
-            if image is None:
-                raise ValueError(f"Missing Kimi K3 image at index {item_idx}")
-            num_media_tokens = self.info.media_tokens_calculator({"type": "image", "image": image})
-            width, height = images.get_image_size(item_idx)
+        def replacement(item_idx: int) -> PromptUpdateDetails[list[int]]:
+            media = mm_items.get_items(
+                "vision_chunk",
+                (VisionChunkProcessorItems,),
+            )
+            item = media.get(item_idx)
+            if item["type"] != "image":
+                raise ValueError("Kimi K3 currently supports image inputs only")
+            image = item["image"]
+            if not hasattr(image, "size"):
+                raise ValueError(
+                    "Kimi K3 image processor did not resolve the input to a PIL image"
+                )
+            width, height = image.size
+            num_media_tokens = self.info.media_tokens_calculator(item)
             full = (
-                f"<|media_begin|>image {width}x{height}<|media_content|>{media_token * num_media_tokens}<|media_end|>"
+                tokenizer.encode(
+                    f"<|media_begin|>image {width}x{height}<|media_content|>",
+                    add_special_tokens=False,
+                )
+                + [media_token_id] * num_media_tokens
+                + tokenizer.encode("<|media_end|>", add_special_tokens=False)
             )
             return PromptUpdateDetails.select_token_id(full, media_token_id)
 
         return [
             PromptReplacement(
-                modality="image",
-                target=image_placeholder,
+                modality="vision_chunk",
+                target=target,
                 replacement=replacement,
             )
         ]
@@ -462,7 +593,7 @@ class AscendKimiK3ForConditionalGeneration(
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         del i
         if modality == "image":
-            return "<|kimi_image_placeholder|>"
+            return _KIMI_IMAGE_PLACEHOLDER
         raise ValueError(f"Kimi K3 does not support modality: {modality}")
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -474,10 +605,10 @@ class AscendKimiK3ForConditionalGeneration(
         self.quant_config = vllm_config.quant_config
         self.hidden_size = config.text_config.hidden_size
         self.device = current_platform.current_device()
-        self.use_data_parallel = _is_vit_use_data_parallel(config.vision_config.num_attention_heads)
+        self.use_data_parallel = is_vit_use_data_parallel(config.vision_config.num_attention_heads)
         vision_quant = self._maybe_ignore_quant_config(self.quant_config)
 
-        with self._mark_tower_model(vllm_config, "image"):
+        with self._mark_tower_model(vllm_config, "vision_chunk"):
             self.vision_tower = KimiK3VisionTower(
                 config.vision_config,
                 quant_config=vision_quant,
@@ -607,6 +738,11 @@ class AscendKimiK3ForConditionalGeneration(
         # Build the optional layer before loading so streaming checkpoint
         # iterators can populate it, then release it when the weight is absent.
         rot_proj = getattr(self.mm_projector, "rot_proj", None)
+        vision_config = self.config.vision_config
+        rot_proj_required_by_config = bool(
+            getattr(self.config, "use_rot_proj", False)
+            or getattr(vision_config, "use_rot_proj", False)
+        )
         skip_prefixes = [] if rot_proj is not None else ["mm_projector.rot_proj."]
         loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
         rot_proj_weight_names = (
@@ -615,7 +751,14 @@ class AscendKimiK3ForConditionalGeneration(
             else set()
         )
         loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        if rot_proj is not None and rot_proj_weight_names.isdisjoint(loaded_weights):
+        rot_proj_reported_loaded = not rot_proj_weight_names.isdisjoint(
+            loaded_weights
+        )
+        if (
+            rot_proj is not None
+            and not rot_proj_required_by_config
+            and not rot_proj_reported_loaded
+        ):
             # StageMissingLayer.__getattr__ delegates to the wrapped module, so
             # rot_proj above is the real one, but del must act on the module
             # that actually holds the registration. Unwrap the placeholder
@@ -625,6 +768,22 @@ class AscendKimiK3ForConditionalGeneration(
             target = cast(nn.Module, getattr(self.mm_projector, "module", self.mm_projector))
             if "rot_proj" in target._modules:
                 del target.rot_proj
+        elif rot_proj_required_by_config:
+            if rot_proj is None:
+                raise RuntimeError(
+                    "Kimi checkpoint config requires mm_projector.rot_proj, "
+                    "but the vLLM model did not construct it"
+                )
+            # AutoWeightsLoader's returned-name audit is not authoritative for
+            # an ordinary nn.Linear nested under the multimodal tower in every
+            # vLLM execution mode.  In particular, deleting this configured
+            # layer made rollout omit a real actor operation even though the
+            # online-weight stream contained mm_projector.rot_proj.weight.
+            logger.warning_once(
+                "Kimi vLLM ROT_PROJ ACTIVE: required_by_config=True "
+                "module_present=True loader_reported=%s",
+                rot_proj_reported_loaded,
+            )
         return loaded_weights
 
 
@@ -669,27 +828,6 @@ class KimiK3MLP(nn.Module):
         hidden_states = self.act_fn(gate_up)
         hidden_states, _ = self.down_proj(hidden_states)
         return hidden_states
-
-
-class _KimiRoutedOutputTransform(nn.Module):
-    """Non-owning callable used by MoERunner after routed expert combine."""
-
-    _norm: nn.Module | None
-    _up_proj: nn.Module
-
-    def __init__(self, norm: nn.Module | None, up_proj: nn.Module) -> None:
-        super().__init__()
-        self._norm = norm
-        self._up_proj = up_proj
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Dynamo fullgraph can trace normal attribute access, but not an
-        # explicit call to object.__getattribute__.
-        norm = self._norm
-        up_proj = self._up_proj
-        if norm is not None:
-            hidden_states = norm(hidden_states)
-        return up_proj(hidden_states)[0]
 
 
 class KimiK3MoE(nn.Module):
@@ -737,11 +875,6 @@ class KimiK3MoE(nn.Module):
             quant_config=latent_quant_config,
             prefix=f"{prefix}.routed_expert_up_proj",
         )
-        routed_output_transform = _KimiRoutedOutputTransform(
-            self.routed_expert_norm,
-            self.routed_expert_up_proj,
-        )
-
         self.shared_experts: KimiK3MLP | None
         if self.num_shared_experts:
             self.shared_experts = KimiK3MLP(
@@ -749,30 +882,34 @@ class KimiK3MoE(nn.Module):
                 hidden_size=self.hidden_size,
                 intermediate_size=config.moe_intermediate_size * self.num_shared_experts,
                 quant_config=quant_config,
-                reduce_results=False,
+                # The routed latent branch is reduced before its nonlinear
+                # RMSNorm.  Reduce the independent shared branch separately.
+                reduce_results=True,
                 prefix=f"{prefix}.shared_experts",
             )
         else:
             self.shared_experts = None
 
         self.experts = FusedMoE(
-            shared_experts=self.shared_experts,
             num_experts=config.num_experts,
             top_k=config.num_experts_per_token,
             hidden_size=self.moe_hidden_size,
             intermediate_size=config.moe_intermediate_size,
             renormalize=config.moe_renormalize,
             quant_config=quant_config,
-            use_grouped_topk=config.use_grouped_topk,
-            num_expert_group=config.num_expert_group,
-            topk_group=config.topk_group,
+            # One-group grouped top-k is ordinary top-k.  Select through the
+            # custom function so score/bias/topk arithmetic matches actor FP32.
+            use_grouped_topk=False,
+            num_expert_group=None,
+            topk_group=None,
             prefix=f"{prefix}.experts",
             scoring_func=config.moe_router_activation_func,
             e_score_correction_bias=self.gate.e_score_correction_bias,
+            custom_routing_function=partial(
+                _kimi_hf_sigmoid_topk,
+                e_score_correction_bias=self.gate.e_score_correction_bias,
+            ),
             routed_scaling_factor=config.routed_scaling_factor,
-            n_shared_experts=self.num_shared_experts,
-            routed_input_transform=self.routed_expert_down_proj,
-            routed_output_transform=routed_output_transform,
             activation=SituActivationConfig(
                 beta=config.activation_situ_beta or 1.0,
                 linear_beta=config.activation_situ_linear_beta,
@@ -782,8 +919,28 @@ class KimiK3MoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        router_logits, _ = self.gate(hidden_states)
-        output = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        # FSDPTurbo computes the router in FP32.  BF16 ReplicatedLinear changes
+        # close top-k boundaries and becomes update-sensitive.
+        router_logits = F.linear(
+            hidden_states.float(),
+            self.gate.weight.float(),
+            bias=None,
+        )
+        identity = hidden_states
+
+        # FusedMoE reduces its TP partial before this nonlinear latent norm.
+        # Applying norm/up_proj as runner transforms would normalize each TP
+        # partial first, which is a different model.
+        hidden_states = self.routed_expert_down_proj(hidden_states)[0]
+        output = self.experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+        )
+        if self.routed_expert_norm is not None:
+            output = self.routed_expert_norm(output)
+        output = self.routed_expert_up_proj(output)[0]
+        if self.shared_experts is not None:
+            output = output + self.shared_experts(identity)
         return output.view(num_tokens, hidden_size)
 
 
@@ -1208,6 +1365,93 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
         for args in weights:
             name, loaded_weight = args[:2]
             loader_kwargs: dict[str, Any] = args[2] if len(args) == 3 else {}
+            name, packed_local_expert_start = _parse_verl_packed_local_name(
+                name
+            )
+
+            # FSDPTurbo stores Kimi routed experts as packed 3-D tensors
+            # [expert, in, out].  Feed each expert through vLLM's authoritative
+            # FusedMoE loader so TP/EP placement and live-reload layout remain
+            # correct on vLLM 0.26.
+            if name.endswith(".experts.gate_up_proj") or name.endswith(
+                ".experts.down_proj"
+            ):
+                moe_prefix = name.rsplit(".experts.", 1)[0] + ".experts"
+                if loaded_weight.ndim != 3:
+                    raise ValueError(
+                        f"Packed Kimi expert weight must be 3-D: {name}"
+                    )
+                num_experts, _, output_dim = loaded_weight.shape
+                expert_start = packed_local_expert_start or 0
+                if expert_start + num_experts > self.config.num_experts:
+                    raise ValueError(
+                        "Packed Kimi expert range "
+                        f"[{expert_start}, {expert_start + num_experts}) exceeds "
+                        f"configured num_experts={self.config.num_experts}: {name}"
+                    )
+                require_local = packed_local_expert_start is not None
+                logical_weight_name = f"{name}.weight"
+
+                if name.endswith(".gate_up_proj"):
+                    param_name = _resolve_packed_expert_weight_name(
+                        f"{moe_prefix}.w13_weight",
+                        params_dict,
+                    )
+                    param = params_dict[param_name]
+                    if output_dim % 2:
+                        raise ValueError(
+                            f"Packed gate_up_proj output is not even: {name}"
+                        )
+                    intermediate_dim = output_dim // 2
+                    for local_expert_id in range(num_experts):
+                        expert_id = expert_start + local_expert_id
+                        expert_weight = loaded_weight[local_expert_id]
+                        for shard_id, start in (
+                            ("w1", 0),
+                            ("w3", intermediate_dim),
+                        ):
+                            shard = expert_weight[
+                                :, start : start + intermediate_dim
+                            ].t().contiguous()
+                            loaded = param.weight_loader(
+                                param,
+                                shard,
+                                logical_weight_name,
+                                expert_id=expert_id,
+                                shard_id=shard_id,
+                                return_success=require_local,
+                            )
+                            if require_local and not loaded:
+                                raise RuntimeError(
+                                    "vLLM rejected trainer packed-local expert "
+                                    f"{expert_id}: {name}"
+                                )
+                else:
+                    param_name = _resolve_packed_expert_weight_name(
+                        f"{moe_prefix}.w2_weight",
+                        params_dict,
+                    )
+                    param = params_dict[param_name]
+                    for local_expert_id in range(num_experts):
+                        expert_id = expert_start + local_expert_id
+                        shard = loaded_weight[local_expert_id].t().contiguous()
+                        loaded = param.weight_loader(
+                            param,
+                            shard,
+                            logical_weight_name,
+                            expert_id=expert_id,
+                            shard_id="w2",
+                            return_success=require_local,
+                        )
+                        if require_local and not loaded:
+                            raise RuntimeError(
+                                "vLLM rejected trainer packed-local expert "
+                                f"{expert_id}: {name}"
+                            )
+                # Report the real live parameter name for verl's post-load
+                # audit instead of the trainer-side packed alias.
+                loaded_params.add(param_name)
+                continue
             if "rotary_emb" in name:
                 continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
@@ -1419,27 +1663,37 @@ class KimiK3VisionMLP(nn.Module):
         bias: bool,
     ) -> None:
         super().__init__()
-        self.fc0 = ColumnParallelLinear(
-            hidden_size,
-            intermediate_size,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.fc0",
-            disable_tp=use_data_parallel,
-        )
-        self.fc1 = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.fc1",
-            disable_tp=use_data_parallel,
-        )
+        self.use_native_linear = use_data_parallel and quant_config is None
+        if self.use_native_linear:
+            self.fc0 = nn.Linear(hidden_size, intermediate_size, bias=bias)
+            self.fc1 = nn.Linear(intermediate_size, hidden_size, bias=bias)
+        else:
+            self.fc0 = ColumnParallelLinear(
+                hidden_size,
+                intermediate_size,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fc0",
+                disable_tp=use_data_parallel,
+            )
+            self.fc1 = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fc1",
+                disable_tp=use_data_parallel,
+            )
         self.activation = activation
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states, _ = self.fc0(hidden_states)
+        if self.use_native_linear:
+            hidden_states = self.fc0(hidden_states)
+        else:
+            hidden_states = self.fc0(hidden_states)[0]
         hidden_states = self.activation(hidden_states)
+        if self.use_native_linear:
+            return self.fc1(hidden_states)
         return self.fc1(hidden_states)[0]
 
 
@@ -1451,7 +1705,7 @@ class KimiK3VisionEncoderLayer(nn.Module):
         prefix: str,
     ) -> None:
         super().__init__()
-        self.use_data_parallel = _is_vit_use_data_parallel(config.num_attention_heads)
+        self.use_data_parallel = is_vit_use_data_parallel(config.num_attention_heads)
         self.hidden_dim = config.hidden_size
         self.qkv_hidden_size = config.qkv_hidden_size
         self.num_heads = config.num_attention_heads
@@ -1477,24 +1731,37 @@ class KimiK3VisionEncoderLayer(nn.Module):
             self.use_data_parallel,
             config.linear_bias,
         )
-        self.wqkv = QKVParallelLinear(
-            hidden_size=self.hidden_dim,
-            head_size=self.head_dim,
-            total_num_heads=self.num_heads,
-            total_num_kv_heads=self.num_heads,
-            bias=config.attn_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.wqkv",
-            disable_tp=self.use_data_parallel,
-        )
-        self.wo = RowParallelLinear(
-            self.qkv_hidden_size,
-            self.hidden_dim,
-            bias=config.attn_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.wo",
-            disable_tp=self.use_data_parallel,
-        )
+        self.use_native_linear = self.use_data_parallel and quant_config is None
+        if self.use_native_linear:
+            self.wqkv = nn.Linear(
+                self.hidden_dim,
+                self.qkv_hidden_size * 3,
+                bias=config.attn_bias,
+            )
+            self.wo = nn.Linear(
+                self.qkv_hidden_size,
+                self.hidden_dim,
+                bias=config.attn_bias,
+            )
+        else:
+            self.wqkv = QKVParallelLinear(
+                hidden_size=self.hidden_dim,
+                head_size=self.head_dim,
+                total_num_heads=self.num_heads,
+                total_num_kv_heads=self.num_heads,
+                bias=config.attn_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.wqkv",
+                disable_tp=self.use_data_parallel,
+            )
+            self.wo = RowParallelLinear(
+                self.qkv_hidden_size,
+                self.hidden_dim,
+                bias=config.attn_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.wo",
+                disable_tp=self.use_data_parallel,
+            )
         self.attn = MMEncoderAttention(
             num_heads=self.num_local_heads,
             head_size=self.head_dim,
@@ -1511,7 +1778,10 @@ class KimiK3VisionEncoderLayer(nn.Module):
         sequence_lengths: torch.Tensor | None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
-        qkv = self.wqkv(hidden_states)[0].view(
+        qkv_out = self.wqkv(hidden_states)
+        if not self.use_native_linear:
+            qkv_out = qkv_out[0]
+        qkv = qkv_out.view(
             num_tokens,
             3,
             self.num_local_heads,
@@ -1530,7 +1800,10 @@ class KimiK3VisionEncoderLayer(nn.Module):
             sequence_lengths=sequence_lengths,
         )
         output = output.reshape(num_tokens, self.num_local_heads * self.head_dim)
-        return self.wo(output)[0]
+        projected = self.wo(output)
+        if not self.use_native_linear:
+            projected = projected[0]
+        return projected
 
     def forward(
         self,
@@ -1672,42 +1945,80 @@ class KimiK3MultiModalProjector(nn.Module):
         self.input_size = config.mm_hidden_size * merge_size
         if config.mm_projector_type != "patchmergerv2":
             raise ValueError(f"Unsupported Kimi K3 projector: {config.mm_projector_type}")
-        self.linear_1 = ReplicatedLinear(
-            self.input_size,
-            self.input_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.linear_1",
+        self.use_native_linear = (
+            is_vit_use_data_parallel(config.num_attention_heads)
+            and quant_config is None
         )
-        self.linear_2 = ReplicatedLinear(
-            self.input_size,
-            config.text_hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.linear_2",
-        )
+        if self.use_native_linear:
+            self.linear_1 = nn.Linear(
+                self.input_size,
+                self.input_size,
+                bias=False,
+            )
+            self.linear_2 = nn.Linear(
+                self.input_size,
+                config.text_hidden_size,
+                bias=False,
+            )
+        else:
+            self.linear_1 = ReplicatedLinear(
+                self.input_size,
+                self.input_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.linear_1",
+            )
+            self.linear_2 = ReplicatedLinear(
+                self.input_size,
+                config.text_hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.linear_2",
+            )
         self.act = get_act_fn(config.projector_hidden_act)
-        self.post_norm = RMSNorm(config.text_hidden_size, eps=config.projector_ln_eps)
+        if self.use_native_linear:
+            self.post_norm = nn.RMSNorm(
+                config.text_hidden_size,
+                eps=config.projector_ln_eps,
+            )
+        else:
+            self.post_norm = RMSNorm(
+                config.text_hidden_size,
+                eps=config.projector_ln_eps,
+            )
         # ModelSlim rotates K3's FP4 activations before INT4 inference. Text
         # embeddings fold this matrix into their input projection, but the
         # vision path ends in RMSNorm, so the rotation must remain explicit.
-        self.rot_proj: ReplicatedLinear | None = ReplicatedLinear(
-            config.text_hidden_size,
-            config.text_hidden_size,
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.rot_proj",
-        )
+        if self.use_native_linear:
+            self.rot_proj: nn.Module | None = nn.Linear(
+                config.text_hidden_size,
+                config.text_hidden_size,
+                bias=False,
+            )
+        else:
+            self.rot_proj = ReplicatedLinear(
+                config.text_hidden_size,
+                config.text_hidden_size,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.rot_proj",
+            )
 
     def forward(self, image_features: torch.Tensor) -> torch.Tensor:
         hidden_states = image_features.reshape(-1, self.input_size)
-        hidden_states = self.linear_1(hidden_states)[0]
+        hidden_states = self.linear_1(hidden_states)
+        if not self.use_native_linear:
+            hidden_states = hidden_states[0]
         hidden_states = self.act(hidden_states)
-        hidden_states = self.linear_2(hidden_states)[0]
+        hidden_states = self.linear_2(hidden_states)
+        if not self.use_native_linear:
+            hidden_states = hidden_states[0]
         hidden_states = self.post_norm(hidden_states)
         rot_proj = getattr(self, "rot_proj", None)
         if rot_proj is not None:
-            hidden_states = rot_proj(hidden_states)[0]
+            hidden_states = rot_proj(hidden_states)
+            if not self.use_native_linear:
+                hidden_states = hidden_states[0]
         return hidden_states
 
 

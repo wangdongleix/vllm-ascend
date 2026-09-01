@@ -21,8 +21,9 @@ from vllm_ascend.quantization.quant_type import QuantType
 
 def _build_weight_layer():
     return SimpleNamespace(
-        w13_weight=nn.Parameter(torch.randn(2, 3, 4)),
-        w2_weight=nn.Parameter(torch.randn(2, 4, 3)),
+        hidden_size=3,
+        w13_weight=nn.Parameter(torch.randn(2, 4, 3)),
+        w2_weight=nn.Parameter(torch.randn(2, 3, 4)),
     )
 
 
@@ -132,9 +133,7 @@ def test_ascend_unquantized_skips_upstream_modular_kernel_init():
     assert method.maybe_make_prepare_finalize() is None
 
 
-def test_process_weights_after_loading_uses_version_specific_layout(
-    monkeypatch,
-):
+def test_moe_reload_round_trip_preserves_runtime_layout(monkeypatch):
     method = _build_unquantized_method()
     layer = _build_weight_layer()
     w13_parameter = layer.w13_weight
@@ -165,6 +164,16 @@ def test_process_weights_after_loading_uses_version_specific_layout(
     assert layer.w2_weight is w2_parameter
     assert layer.w13_weight.weight_loader is w13_parameter.weight_loader
     assert layer.w2_weight.weight_loader is w2_parameter.weight_loader
+
+    method.prepare_weights_for_loading(layer)
+    torch.testing.assert_close(layer.w13_weight, original_w13)
+    torch.testing.assert_close(layer.w2_weight, original_w2)
+
+    method.process_weights_after_loading(layer)
+    torch.testing.assert_close(layer.w13_weight, original_w13.transpose(1, 2))
+    torch.testing.assert_close(layer.w2_weight, original_w2.transpose(1, 2))
+    assert layer.w13_weight is w13_parameter
+    assert layer.w2_weight is w2_parameter
 
 
 def test_ascend_runner_promotes_runtime_state_to_buffer():

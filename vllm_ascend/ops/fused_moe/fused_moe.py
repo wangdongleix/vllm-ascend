@@ -129,13 +129,42 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # Do not let upstream modular-kernel initialization replace it.
         return None
 
+    @torch.no_grad()
+    def prepare_weights_for_loading(self, layer):
+        """Restore the canonical loader layout before an online actor reload.
+
+        Ascend transposes unquantized MoE weights for execution.  verl calls
+        this hook before each live weight update so packed Kimi expert shards
+        are always loaded into one stable layout instead of being transposed
+        again on every update.
+        """
+        hidden_size = int(
+            getattr(layer, "hidden_size", getattr(self.moe, "hidden_dim", -1))
+        )
+        if hidden_size <= 0:
+            return
+
+        for name, hidden_axis in (("w13_weight", 1), ("w2_weight", 2)):
+            param = getattr(layer, name, None)
+            if param is None or not hasattr(param, "data") or param.data.ndim != 3:
+                continue
+            if int(param.shape[hidden_axis]) == hidden_size:
+                param.data = param.data.transpose(1, 2).contiguous()
+
     def process_weights_after_loading(self, layer):
         super(UnquantizedFusedMoEMethod, self).process_weights_after_loading(layer)
 
-        w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
+        hidden_size = int(
+            getattr(layer, "hidden_size", getattr(self.moe, "hidden_dim", -1))
+        )
+        w13_data = self._maybe_pad_weight(layer.w13_weight.data)
+        if hidden_size <= 0 or int(w13_data.shape[1]) != hidden_size:
+            w13_data = w13_data.transpose(1, 2).contiguous()
         layer.w13_weight.data = w13_data
 
-        w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
+        w2_data = self._maybe_pad_weight(layer.w2_weight.data)
+        if hidden_size <= 0 or int(w2_data.shape[2]) != hidden_size:
+            w2_data = w2_data.transpose(1, 2).contiguous()
         layer.w2_weight.data = w2_data
 
         # TODO: Current dispatch_ffn_combine/mega_moe fusion operator ONLY supports NZ format.

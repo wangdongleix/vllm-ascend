@@ -14,20 +14,20 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
-"""Thin vLLM-facing processor adapter for Kimi K3 images."""
+"""Thin vLLM-facing processor adapter for Kimi K3 vision chunks."""
 
 from transformers import BaseImageProcessor, BatchFeature, TensorType
 from transformers.processing_utils import ProcessorMixin
+from vllm.multimodal.inputs import VisionChunk
 from vllm.tokenizers.hf import HfTokenizer
 
 
 class KimiK3Processor(ProcessorMixin):
-    """HF-style adapter for K3's standard ``image`` modality.
+    """HF-style adapter for K3's unified ``vision_chunk`` modality.
 
-    The checkpoint image processor consumes media dictionaries, while vLLM
-    supplies bare image objects. Prompt expansion is intentionally left to the
-    model's prompt-update hook so cached and uncached processor paths share one
-    implementation.
+    vLLM 0.26 passes Kimi images as ``VisionChunkImage`` dictionaries. Prompt
+    expansion is intentionally left to the model's prompt-update hook so
+    cached and uncached processor paths share one implementation.
     """
 
     attributes = ["image_processor", "tokenizer"]
@@ -43,17 +43,14 @@ class KimiK3Processor(ProcessorMixin):
     def __call__(
         self,
         text: str | list[str] | None = None,
-        images: object | list[object] | None = None,
+        vision_chunks: list[VisionChunk] | None = None,
         return_tensors: str | TensorType | None = None,
         **kwargs,
     ) -> BatchFeature:
         del kwargs
-        if images is not None:
-            if not isinstance(images, list):
-                images = [images]
-            media_inputs = [{"type": "image", "image": image} for image in images]
+        if vision_chunks is not None:
             mm_inputs = self.image_processor.preprocess(
-                media_inputs,
+                vision_chunks,
                 return_tensors=return_tensors,
             )
         else:

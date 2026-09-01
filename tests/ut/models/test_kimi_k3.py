@@ -106,6 +106,11 @@ def test_kimi_k3_projector_registers_rotation_for_weight_loading(
     monkeypatch.setattr(kimi_k3, "ReplicatedLinear", StubReplicatedLinear)
     monkeypatch.setattr(kimi_k3, "RMSNorm", lambda *args, **kwargs: nn.Identity())
     monkeypatch.setattr(kimi_k3, "get_act_fn", lambda *args, **kwargs: nn.Identity())
+    monkeypatch.setattr(
+        kimi_k3,
+        "is_vit_use_data_parallel",
+        lambda num_heads: False,
+    )
     config = KimiK3VisionConfig(
         mm_hidden_size=2,
         text_hidden_size=8,
@@ -141,6 +146,7 @@ def test_kimi_k3_enables_projector_rotation_only_when_weight_is_loaded(
     monkeypatch.setattr(kimi_k3, "AutoWeightsLoader", StubLoader)
     wrapper = AscendKimiK3ForConditionalGeneration.__new__(AscendKimiK3ForConditionalGeneration)
     nn.Module.__init__(wrapper)
+    wrapper.config = SimpleNamespace(vision_config=SimpleNamespace())
     wrapper.mm_projector = nn.Module()
     wrapper.mm_projector.rot_proj = nn.Linear(1, 1, bias=False)
 
@@ -173,6 +179,7 @@ def test_kimi_k3_deletes_unused_rot_proj_when_projector_is_placeholder(
     monkeypatch.setattr(kimi_k3, "AutoWeightsLoader", StubLoader)
     wrapper = AscendKimiK3ForConditionalGeneration.__new__(AscendKimiK3ForConditionalGeneration)
     nn.Module.__init__(wrapper)
+    wrapper.config = SimpleNamespace(vision_config=SimpleNamespace())
     projector = nn.Module()
     projector.rot_proj = nn.Linear(1, 1, bias=False)
     wrapper.mm_projector = StageMissingLayer("vision_tower", projector)
@@ -198,6 +205,7 @@ def test_kimi_k3_projector_applies_rotation_only_after_weight_load():
     projector = KimiK3MultiModalProjector.__new__(KimiK3MultiModalProjector)
     nn.Module.__init__(projector)
     projector.input_size = 2
+    projector.use_native_linear = False
     projector.linear_1 = PassthroughLinear()
     projector.linear_2 = PassthroughLinear()
     projector.act = nn.Identity()
@@ -232,6 +240,16 @@ def test_kimi_k3_projector_applies_rotation_only_after_weight_load():
             "layers.1.experts.w2_weight_packed",
         ),
         (
+            "layers.1.experts.w13_weight",
+            {"layers.1.experts.routed_experts.w13_weight": object()},
+            "layers.1.experts.routed_experts.w13_weight",
+        ),
+        (
+            "layers.1.experts.w2_weight",
+            {"layers.1.experts.routed_experts.w2_weight_packed": object()},
+            "layers.1.experts.routed_experts.w2_weight_packed",
+        ),
+        (
             "layers.1.experts.w13_weight_scale",
             {"layers.1.experts.w13_weight_packed": object()},
             "layers.1.experts.w13_weight_scale",
@@ -244,6 +262,75 @@ def test_kimi_k3_resolves_packed_expert_checkpoint_names(
     expected: str,
 ):
     assert _resolve_packed_expert_weight_name(name, params) == expected
+
+
+def test_kimi_k3_loads_verl_packed_local_experts_into_v026_routed_experts():
+    model = KimiK3TextModel.__new__(KimiK3TextModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(num_experts=32)
+    model.layers = nn.ModuleList([nn.Module(), nn.Module()])
+    moe = nn.Module()
+    moe.experts = nn.Module()
+    moe.experts.routed_experts = nn.Module()
+    model.layers[1].block_sparse_moe = moe
+
+    w13_weight = nn.Parameter(torch.empty(1))
+    w2_weight = nn.Parameter(torch.empty(1))
+    w13_weight.weight_loader = MagicMock(return_value=True)
+    w2_weight.weight_loader = MagicMock(return_value=True)
+    moe.experts.routed_experts.register_parameter("w13_weight", w13_weight)
+    moe.experts.routed_experts.register_parameter("w2_weight", w2_weight)
+
+    gate_up = torch.arange(4 * 3 * 10, dtype=torch.float32).view(4, 3, 10)
+    down = torch.arange(4 * 5 * 3, dtype=torch.float32).view(4, 5, 3)
+    weights = [
+        (
+            "layers.1.block_sparse_moe.experts.gate_up_proj"
+            ".__verl_packed_local__.8",
+            gate_up,
+        ),
+        (
+            "layers.1.block_sparse_moe.experts.down_proj"
+            ".__verl_packed_local__.8",
+            down,
+        ),
+    ]
+
+    with patch(
+        "vllm_ascend.models.kimi_k3.fused_moe_make_expert_params_mapping",
+        return_value=[],
+    ):
+        loaded = model.load_weights(weights)
+
+    expected_prefix = "layers.1.block_sparse_moe.experts.routed_experts"
+    assert loaded == {
+        f"{expected_prefix}.w13_weight",
+        f"{expected_prefix}.w2_weight",
+    }
+    assert [
+        call.kwargs["expert_id"]
+        for call in w13_weight.weight_loader.call_args_list
+    ] == [8, 8, 9, 9, 10, 10, 11, 11]
+    assert [
+        call.kwargs["shard_id"]
+        for call in w13_weight.weight_loader.call_args_list
+    ] == ["w1", "w3"] * 4
+    assert [
+        call.kwargs["expert_id"]
+        for call in w2_weight.weight_loader.call_args_list
+    ] == [8, 9, 10, 11]
+    torch.testing.assert_close(
+        w13_weight.weight_loader.call_args_list[0].args[1],
+        gate_up[0, :, :5].t().contiguous(),
+    )
+    torch.testing.assert_close(
+        w13_weight.weight_loader.call_args_list[1].args[1],
+        gate_up[0, :, 5:].t().contiguous(),
+    )
+    torch.testing.assert_close(
+        w2_weight.weight_loader.call_args_list[0].args[1],
+        down[0].t().contiguous(),
+    )
 
 
 def test_kimi_k3_config_normalizes_checkpoint_schema_for_vllm():
@@ -260,8 +347,9 @@ def test_kimi_k3_config_normalizes_checkpoint_schema_for_vllm():
         use_unified_vision_chunk=True,
     )
 
-    # Old plugin checkpoints used vision_chunk, while vLLM consumes image.
-    assert not hasattr(config, "use_unified_vision_chunk")
+    # vLLM's renderer must normalize standard image content to the same
+    # vision_chunk modality consumed by verl's Kimi adapter.
+    assert config.use_unified_vision_chunk is True
     # MoonViT consumers use canonical names instead of checkpoint vt_* names.
     assert config.vision_config.num_attention_heads == 12
     assert config.vision_config.hidden_size == 1024
@@ -269,8 +357,14 @@ def test_kimi_k3_config_normalizes_checkpoint_schema_for_vllm():
     assert config.vision_config.text_hidden_size == config.text_config.hidden_size
 
 
-def test_kimi_k3_model_uses_image_placeholder_from_upstream_contract():
-    assert AscendKimiK3ForConditionalGeneration.get_placeholder_str("image", 0) == "<|kimi_image_placeholder|>"
+def test_kimi_k3_model_uses_unified_vision_chunk_placeholder():
+    assert AscendKimiK3ForConditionalGeneration.get_placeholder_str(
+        "image",
+        0,
+    ) == (
+        "<|media_begin|>image<|media_content|>"
+        "<|media_pad|><|media_end|>"
+    )
     with pytest.raises(ValueError, match="does not support modality"):
         AscendKimiK3ForConditionalGeneration.get_placeholder_str(
             "vision_chunk",
@@ -381,54 +475,13 @@ def test_kimi_k3_vision_tp16_falls_back_to_data_parallel(
     assert layer.use_data_parallel is True
     assert layer.tp_size == 1
     assert layer.num_local_heads == 12
-    assert qkv_kwargs["disable_tp"] is True
-    assert output_kwargs["disable_tp"] is True
-
-
-def test_kimi_k3_vit_dp_compat_calls_release_helper_without_num_heads(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    calls: list[None] = []
-
-    def release_helper():
-        calls.append(None)
-        return False
-
-    monkeypatch.setattr(kimi_k3, "vllm_version_is", lambda version: version == "0.25.1")
-    monkeypatch.setattr(kimi_k3, "get_tensor_model_parallel_world_size", lambda: 4)
-    monkeypatch.setattr(kimi_k3, "is_vit_use_data_parallel", release_helper)
-
-    assert kimi_k3._is_vit_use_data_parallel(8) is False
-    assert calls == [None]
-
-
-def test_kimi_k3_vit_dp_compat_recreates_release_tp_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    def unexpected_release_helper():
-        pytest.fail("The release helper must not run after the TP fallback")
-
-    monkeypatch.setattr(kimi_k3, "vllm_version_is", lambda version: version == "0.25.1")
-    monkeypatch.setattr(kimi_k3, "get_tensor_model_parallel_world_size", lambda: 16)
-    monkeypatch.setattr(kimi_k3, "is_vit_use_data_parallel", unexpected_release_helper)
-
-    assert kimi_k3._is_vit_use_data_parallel(12) is True
-
-
-def test_kimi_k3_vit_dp_compat_passes_num_heads_to_main_helper(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    calls = []
-
-    def main_helper(num_heads):
-        calls.append(num_heads)
-        return True
-
-    monkeypatch.setattr(kimi_k3, "vllm_version_is", lambda version: False)
-    monkeypatch.setattr(kimi_k3, "is_vit_use_data_parallel", main_helper)
-
-    assert kimi_k3._is_vit_use_data_parallel(12) is True
-    assert calls == [12]
+    assert layer.use_native_linear is True
+    assert isinstance(layer.wqkv, nn.Linear)
+    assert isinstance(layer.wo, nn.Linear)
+    # vLLM 0.26's data-parallel vision path uses ordinary torch linears;
+    # sharded vLLM linears (and their legacy disable_tp kwarg) are bypassed.
+    assert qkv_kwargs == {}
+    assert output_kwargs == {}
 
 
 def test_kimi_k3_skips_explicit_move_for_meta_modules():
