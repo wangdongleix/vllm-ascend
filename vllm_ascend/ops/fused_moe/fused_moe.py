@@ -162,10 +162,11 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def prepare_weights_for_loading(self, layer):
         """Restore the canonical loader layout before an online actor reload.
 
-        Ascend transposes unquantized MoE weights for execution.  verl calls
+        Ascend transposes unquantized MoE weights for execution. verl calls
         this hook before each live weight update so packed Kimi expert shards
-        are always loaded into one stable layout instead of being transposed
-        again on every update.
+        are loaded through a canonical-layout view. Keep it as a view: ACL
+        graphs capture the runtime storage address and must observe the new
+        weights without being recaptured after every update.
         """
         hidden_size = int(
             getattr(layer, "hidden_size", getattr(self.moe, "hidden_dim", -1))
@@ -178,7 +179,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             if param is None or not hasattr(param, "data") or param.data.ndim != 3:
                 continue
             if int(param.shape[hidden_axis]) == hidden_size:
-                param.data = param.data.transpose(1, 2).contiguous()
+                param.data = param.data.transpose(1, 2)
 
     def process_weights_after_loading(self, layer):
         super(UnquantizedFusedMoEMethod, self).process_weights_after_loading(layer)

@@ -194,16 +194,28 @@ def test_moe_reload_round_trip_preserves_runtime_layout(monkeypatch):
     assert layer.w2_weight is w2_parameter
     assert layer.w13_weight.weight_loader is w13_parameter.weight_loader
     assert layer.w2_weight.weight_loader is w2_parameter.weight_loader
+    runtime_w13_ptr = layer.w13_weight.data_ptr()
+    runtime_w2_ptr = layer.w2_weight.data_ptr()
 
     method.prepare_weights_for_loading(layer)
     torch.testing.assert_close(layer.w13_weight, original_w13)
     torch.testing.assert_close(layer.w2_weight, original_w2)
+    assert layer.w13_weight.data_ptr() == runtime_w13_ptr
+    assert layer.w2_weight.data_ptr() == runtime_w2_ptr
+
+    reloaded_w13 = torch.randn_like(original_w13)
+    reloaded_w2 = torch.randn_like(original_w2)
+    with torch.no_grad():
+        layer.w13_weight.copy_(reloaded_w13)
+        layer.w2_weight.copy_(reloaded_w2)
 
     method.process_weights_after_loading(layer)
-    torch.testing.assert_close(layer.w13_weight, original_w13.transpose(1, 2))
-    torch.testing.assert_close(layer.w2_weight, original_w2.transpose(1, 2))
+    torch.testing.assert_close(layer.w13_weight, reloaded_w13.transpose(1, 2))
+    torch.testing.assert_close(layer.w2_weight, reloaded_w2.transpose(1, 2))
     assert layer.w13_weight is w13_parameter
     assert layer.w2_weight is w2_parameter
+    assert layer.w13_weight.data_ptr() == runtime_w13_ptr
+    assert layer.w2_weight.data_ptr() == runtime_w2_ptr
 
 
 def test_ascend_runner_promotes_runtime_state_to_buffer():
