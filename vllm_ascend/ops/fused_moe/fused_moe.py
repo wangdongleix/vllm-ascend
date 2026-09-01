@@ -110,6 +110,35 @@ def make_eplb_placement_config(eplb_config, num_redundant_experts: int) -> Simpl
     )
 
 
+def _capture_executed_routing(
+    layer: torch.nn.Module,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> None:
+    """Capture post-routing IDs/weights with the owning MoE layer index.
+
+    vLLM 0.26 passes the weight-owning ``RoutedExperts`` module to quant
+    methods, while ``layer_id`` remains a property of its ``MoERunner``.
+    ``NPUModelRunner._bind_routed_experts_capturer`` therefore records the
+    owning index on the child module when it binds the capturer.
+    """
+    capturer = getattr(layer, "_ascend_routed_experts_capturer", None)
+    if capturer is None:
+        return
+
+    layer_id = getattr(layer, "_ascend_routed_experts_layer_id", None)
+    if layer_id is None:
+        raise RuntimeError(
+            "Ascend R3 capture is bound to RoutedExperts without its owning "
+            "MoERunner layer index"
+        )
+    capturer.capture(
+        layer_id=int(layer_id),
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+    )
+
+
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def __init__(self, moe: FusedMoEConfig = None, tid2eid=None):
         super().__init__(moe=moe)
@@ -241,16 +270,6 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             tid2eid=self.tid2eid,
             input_ids=input_ids,
         )
-        try:
-            _vllm_config = get_current_vllm_config()
-        except AssertionError:
-            _vllm_config = None
-        model_config = None if _vllm_config is None else _vllm_config.model_config
-        if model_config is not None and model_config.enable_return_routed_experts:
-            capturer = getattr(layer, "_ascend_routed_experts_capturer", None)
-            if capturer is not None:
-                capturer.capture(layer_id=layer.layer_id, topk_ids=topk_ids)
-
         if zero_expert_num > 0 and zero_expert_type is not None:
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
                 expert_indices=topk_ids,
@@ -267,6 +286,19 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         if enable_force_load_balance:
             random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
+
+        # Full R3 must capture the exact IDs and BF16 weights consumed by the
+        # expert kernel, after all routing mutations and dtype conversion.
+        #
+        # Do not gate this hot-path hook on ``get_current_vllm_config()``.
+        # vLLM 0.26 only installs that context while constructing/loading the
+        # model and while capturing graphs; an ordinary eager prefill forward
+        # runs outside it.  Using the transient context as the switch therefore
+        # captured graph warmup routes but silently left every real prefill row
+        # at the cleared expert-0 value.  The capturer attribute is the durable
+        # runtime contract: NPUModelRunner binds it only when routed-expert
+        # return is enabled, and unbinds it by setting the attribute to None.
+        _capture_executed_routing(layer, topk_ids, topk_weights)
 
         if getattr(layer, "swigluoai_uninterleave", False):
             activation = "swigluoai_uninterleave"

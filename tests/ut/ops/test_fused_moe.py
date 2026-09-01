@@ -13,6 +13,7 @@ from vllm_ascend.ops.fused_moe import fused_moe as fused_moe_module
 from vllm_ascend.ops.fused_moe.fused_moe import (
     AscendMoERunner,
     AscendUnquantizedFusedMoEMethod,
+    _capture_executed_routing,
     make_eplb_placement_config,
     use_multistage_eplb_load,
 )
@@ -47,6 +48,35 @@ def _build_unquantized_method(*, dynamic_eplb: bool = False):
     method.moe = SimpleNamespace(has_bias=False)
     method._maybe_pad_weight = MagicMock(side_effect=lambda weight: weight)
     return method
+
+
+def test_capture_executed_routing_uses_v026_owner_layer_index():
+    capturer = MagicMock()
+    layer = SimpleNamespace(
+        _ascend_routed_experts_capturer=capturer,
+        _ascend_routed_experts_layer_id=7,
+    )
+    topk_ids = torch.tensor([[3, 5]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.25, 0.75]], dtype=torch.bfloat16)
+
+    _capture_executed_routing(layer, topk_ids, topk_weights)
+
+    capturer.capture.assert_called_once_with(
+        layer_id=7,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+    )
+
+
+def test_capture_executed_routing_rejects_missing_v026_owner_layer_index():
+    layer = SimpleNamespace(_ascend_routed_experts_capturer=MagicMock())
+
+    with pytest.raises(RuntimeError, match="without its owning MoERunner layer index"):
+        _capture_executed_routing(
+            layer,
+            torch.tensor([[3, 5]], dtype=torch.int32),
+            torch.tensor([[0.25, 0.75]], dtype=torch.bfloat16),
+        )
 
 
 def test_ascend_runner_prefers_runtime_situ_activation():

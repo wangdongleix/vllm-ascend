@@ -20,7 +20,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from vllm_ascend.patch.worker.patch_routed_experts_capture import capture
+from vllm_ascend.patch.worker.patch_routed_experts_capture import (
+    _pack_kimi_full_r3,
+    capture,
+)
 
 
 class TestRoutedExpertsCapturerCapture:
@@ -34,10 +37,11 @@ class TestRoutedExpertsCapturerCapture:
         capturer.device_buffer = torch.zeros((100, 10, 2), dtype=torch.int32)
         return capturer
 
-    def _create_mock_forward_context(self, dp_metadata=None):
+    def _create_mock_forward_context(self, dp_metadata=None, num_tokens=None):
         """Create a mock forward context."""
         ctx = MagicMock()
         ctx.dp_metadata = dp_metadata
+        ctx.num_tokens = num_tokens
         return ctx
 
     def _create_mock_dp_metadata(self, num_tokens_across_dp_cpu):
@@ -50,7 +54,7 @@ class TestRoutedExpertsCapturerCapture:
     def test_single_dp(self, mock_get_ctx):
         """Test single DP scenario (no data parallelism)."""
         capturer = self._create_mock_capturer(dp_rank=0, tp_size=1)
-        ctx = self._create_mock_forward_context(dp_metadata=None)
+        ctx = self._create_mock_forward_context(dp_metadata=None, num_tokens=3)
         mock_get_ctx.return_value = ctx
 
         topk_ids = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32)
@@ -60,6 +64,55 @@ class TestRoutedExpertsCapturerCapture:
         expected = topk_ids
         actual = capturer.device_buffer[:3, 0, :]
         torch.testing.assert_close(actual, expected)
+
+    @patch(
+        "vllm_ascend.patch.worker.patch_routed_experts_capture._EXTRA_CTX"
+    )
+    @patch(
+        "vllm_ascend.patch.worker.patch_routed_experts_capture._gather_tp_shards"
+    )
+    @patch("vllm_ascend.patch.worker.patch_routed_experts_capture.get_forward_context")
+    def test_single_dp_all2all_gathers_full_r3_tp_shards(
+        self, mock_get_ctx, mock_gather, mock_extra_ctx
+    ):
+        """Single-DP ALLTOALL must not leave non-local TP rows as zeros."""
+        from vllm_ascend.ascend_forward_context import MoECommType
+
+        capturer = self._create_mock_capturer(dp_rank=0, tp_size=2)
+        capturer.device_buffer = torch.zeros((100, 10, 6), dtype=torch.int32)
+        mock_get_ctx.return_value = self._create_mock_forward_context(
+            dp_metadata=None, num_tokens=4
+        )
+        local_ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+        local_weights = torch.tensor(
+            [[0.25, 0.75], [0.5, 0.5]], dtype=torch.bfloat16
+        )
+        remote_ids = torch.tensor([[5, 6], [7, 8]], dtype=torch.int32)
+        remote_weights = torch.tensor(
+            [[0.125, 0.875], [0.375, 0.625]], dtype=torch.bfloat16
+        )
+        expected = torch.cat(
+            (
+                _pack_kimi_full_r3(local_ids, local_weights),
+                _pack_kimi_full_r3(remote_ids, remote_weights),
+            )
+        )
+        mock_gather.return_value = expected
+        mock_extra_ctx.moe_comm_type = MoECommType.ALLTOALL
+        capture(
+            capturer,
+            layer_id=1,
+            topk_ids=local_ids,
+            topk_weights=local_weights,
+        )
+
+        mock_gather.assert_called_once()
+        gather_args, gather_kwargs = mock_gather.call_args
+        torch.testing.assert_close(
+            gather_args[0], _pack_kimi_full_r3(local_ids, local_weights)
+        )
+        assert gather_kwargs == {"gathered_rows": 4, "tp_size": 2}
+        torch.testing.assert_close(capturer.device_buffer[:4, 1, :], expected)
 
     @patch("vllm_ascend.patch.worker.patch_routed_experts_capture.get_forward_context")
     def test_multi_dp_naive_dispatch(self, mock_get_ctx):
@@ -200,32 +253,35 @@ class TestRoutedExpertsCapturerCapture:
             else:
                 delattr(_EXTRA_CTX, "moe_comm_type")
 
+    @patch("vllm_ascend.patch.worker.patch_routed_experts_capture._EXTRA_CTX")
     @patch("vllm_ascend.patch.worker.patch_routed_experts_capture.get_forward_context")
-    def test_unexpected_batch_dim(self, mock_get_ctx):
+    def test_unexpected_batch_dim(self, mock_get_ctx, mock_extra_ctx):
         """Test that unexpected batch dimension raises AssertionError."""
+        from vllm_ascend.ascend_forward_context import MoECommType
+
         capturer = self._create_mock_capturer(dp_rank=0, tp_size=2)
         dp_metadata = self._create_mock_dp_metadata([5, 7])
         ctx = self._create_mock_forward_context(dp_metadata=dp_metadata)
         mock_get_ctx.return_value = ctx
+        mock_extra_ctx.moe_comm_type = MoECommType.ALLTOALL
 
         topk_ids = torch.randint(0, 8, (100, 2)).to(torch.int32)
 
-        with pytest.raises(AssertionError, match="unexpected topk_ids batch"):
+        with pytest.raises(AssertionError, match="unexpected payload batch"):
             capture(capturer, layer_id=0, topk_ids=topk_ids)
 
     @patch("vllm_ascend.patch.worker.patch_routed_experts_capture.get_forward_context")
     def test_layer_id_out_of_bounds(self, mock_get_ctx):
         """Test that out-of-bounds layer_id is handled gracefully."""
         capturer = self._create_mock_capturer(dp_rank=0, tp_size=1)
-        ctx = self._create_mock_forward_context(dp_metadata=None)
+        ctx = self._create_mock_forward_context(dp_metadata=None, num_tokens=1)
         mock_get_ctx.return_value = ctx
 
         topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
         capturer.device_buffer = torch.zeros((100, 5, 2))
 
-        capture(capturer, layer_id=10, topk_ids=topk_ids)
-
-        assert torch.all(capturer.device_buffer == 0)
+        with pytest.raises(IndexError, match="outside capture buffer"):
+            capture(capturer, layer_id=10, topk_ids=topk_ids)
 
 
 if __name__ == "__main__":

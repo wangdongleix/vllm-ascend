@@ -15,7 +15,35 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
+
 _GLOBAL_PATCH_APPLIED = False
+
+
+def _apply_vllm_source_version_override() -> None:
+    """Make source-tree vLLM report the reviewed version without editing it.
+
+    The container still has a 0.23 editable distribution whose generated
+    ``vllm._version`` module is visible even when the 0.26 source tree is first
+    on PYTHONPATH.  ``VLLM_VERSION`` is already the vLLM-Ascend compatibility
+    override; apply it to vLLM's public version module as well so verl and
+    vLLM's cache/startup fingerprints do not branch on stale metadata.
+    """
+    source_version = os.getenv("VLLM_VERSION")
+    if not source_version:
+        return
+
+    from packaging.version import Version
+
+    parsed = Version(source_version)
+    import vllm
+    import vllm.version as vllm_version_module
+
+    version_tuple = tuple(parsed.release)
+    vllm.__version__ = source_version
+    vllm.__version_tuple__ = version_tuple
+    vllm_version_module.__version__ = source_version
+    vllm_version_module.__version_tuple__ = version_tuple
 
 
 def _ensure_global_patch():
@@ -29,14 +57,26 @@ def _ensure_global_patch():
     if _GLOBAL_PATCH_APPLIED:
         return
 
+    _apply_vllm_source_version_override()
+
     from vllm_ascend.utils import adapt_patch
 
     adapt_patch(is_global_patch=True)
+    # The routed-experts protocol is allocated in both EngineCore and worker
+    # processes.  Install Kimi's full-R3 wire width from the general plugin,
+    # before either side constructs its buffer.
+    from vllm_ascend.patch.kimi_full_r3_schema import (
+        install_kimi_full_r3_schema_patch,
+    )
+
+    install_kimi_full_r3_schema_patch()
     _GLOBAL_PATCH_APPLIED = True
 
 
 def register():
     """Register the NPU platform."""
+
+    _apply_vllm_source_version_override()
 
     return "vllm_ascend.platform.NPUPlatform"
 
@@ -70,6 +110,8 @@ def register_service_profiling():
 
 
 def register_model():
+    _ensure_global_patch()
+
     from vllm_ascend.transformers_utils.configs.kimi_k3 import register_kimi_k3_config
 
     register_kimi_k3_config()

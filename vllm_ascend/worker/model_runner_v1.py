@@ -2404,9 +2404,30 @@ class NPUModelRunner(GPUModelRunner):
                 # synchronized by ``_to_list``'s event.synchronize(), so
                 # the pinned buffers are ready to be wrapped as numpy.
                 total = scheduler_output.total_num_scheduled_tokens
+                routing_data = self.routed_experts_cpu[:total].numpy()
+                slot_mapping = self.routed_experts_slot_mapping_cpu[:total].numpy()
+                if total > 16 and not getattr(
+                    self, "_kimi_full_r3_worker_transport_logged", False
+                ):
+                    if bool(np.any(slot_mapping < 0)):
+                        first_bad = int(np.flatnonzero(slot_mapping < 0)[0])
+                        raise RuntimeError(
+                            "Kimi full R3 worker exported an invalid physical "
+                            "slot for a real token: "
+                            f"row={first_bad}, slot={int(slot_mapping[first_bad])}, "
+                            f"total={total}"
+                        )
+                    marker = (
+                        "Kimi vLLM full R3 WORKER D2H ACTIVE: "
+                        f"rows={total} payload_width={routing_data.shape[-1]} "
+                        f"first_slot={int(slot_mapping[0])} "
+                        "negative_slots=0"
+                    )
+                    print(marker, flush=True)
+                    self._kimi_full_r3_worker_transport_logged = True
                 model_runner_output.routed_experts = RoutedExpertsLists(
-                    routing_data=self.routed_experts_cpu[:total].numpy(),
-                    slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
+                    routing_data=routing_data,
+                    slot_mapping=slot_mapping,
                 )
             return model_runner_output
         
@@ -2966,14 +2987,19 @@ class NPUModelRunner(GPUModelRunner):
                 # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
                 slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
                 blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
-            if self.model_config.enable_return_routed_experts and kv_cache_gid == 0:
+            if (
+                self.model_config.enable_return_routed_experts
+                and kv_cache_gid == self.routed_experts_attn_gid
+            ):
                 if self.routed_experts_initialized:
-                    # snapshot slot_mapping into a private device
-                    # buffer so the next ``_prepare_inputs`` does not
-                    # overwrite it while D2H is still pending.
-                    n = slot_mapping.shape[0]
-                    self.routed_experts_slot_mapping_device[:n].copy_(
-                        slot_mapping
+                    # The scheduler's RoutedExpertsManager indexes physical
+                    # slots from the first FullAttentionSpec group. Kimi K3
+                    # has hybrid KDA/full-attention KV groups, so group 0 is
+                    # not necessarily that group. Keep this selection exactly
+                    # aligned with GPUModelRunner._get_attention_kv_cache_gid
+                    # and copy only the real (unpadded) token rows.
+                    self.routed_experts_slot_mapping_device[:num_tokens].copy_(
+                        slot_mapping[:num_tokens]
                     )
             return blk_table_tensor, slot_mapping
 
@@ -3828,8 +3854,14 @@ class NPUModelRunner(GPUModelRunner):
 
         for module in self.compilation_config.static_forward_context.values():
             if isinstance(module, AscendMoERunner):
-                module._ascend_routed_experts_capturer = capturer
+                layer_id = module.layer_id
+                if layer_id is None:
+                    raise RuntimeError(
+                        "Cannot bind Ascend routed-expert capture: MoERunner "
+                        f"has no layer index (layer_name={module.layer_name!r})"
+                    )
                 module.routed_experts._ascend_routed_experts_capturer = capturer
+                module.routed_experts._ascend_routed_experts_layer_id = layer_id
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()
