@@ -20,7 +20,7 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from functools import partial
-from typing import Annotated, Any, Callable, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
 import numpy as np
 import torch
@@ -71,7 +71,6 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.kimi_k25_vit import (
     Learnable2DInterpPosEmbDivided_fixed,
     Rope2DPosEmbRepeated,
-    apply_rope,
     tpool_patch_merger,
 )
 from vllm.model_executor.models.utils import (
@@ -108,7 +107,6 @@ from vllm.multimodal.processing import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processor import cached_get_image_processor
-from vllm.triton_utils import HAS_TRITON
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -117,19 +115,7 @@ from vllm_ascend.ops.kimi_kda import uses_kimi_k3_global_inputs_embeds
 from vllm_ascend.ops.kimi_kda_state import kimi_kda_state_shape
 from vllm_ascend.transformers_utils.configs.kimi_k3 import KimiK3Config, KimiK3TextConfig, KimiK3VisionConfig
 from vllm_ascend.transformers_utils.processors.kimi_k3 import KimiK3Processor
-from vllm_ascend.utils import vllm_version_is
 
-apply_attn_res: (
-    Callable[
-        [torch.Tensor, torch.Tensor, nn.Module, nn.Module],
-        torch.Tensor,
-    ]
-    | None
-) = None
-if HAS_TRITON:
-    from vllm_ascend.ops.triton.kimi_k3.attention_residual import apply_attn_res as triton_apply_attn_res
-
-    apply_attn_res = triton_apply_attn_res
 _VERL_PACKED_LOCAL_MARKER = ".__verl_packed_local__."
 _KIMI_IMAGE_PLACEHOLDER = (
     "<|media_begin|>image<|media_content|><|media_pad|><|media_end|>"
@@ -1070,20 +1056,24 @@ def _apply_attention_residual(
     projection: nn.Module,
     norm: RMSNorm,
 ) -> torch.Tensor:
-    """Apply K3's learned normalized mixture over residual block starts."""
-    if apply_attn_res is not None and prefix_sum.device.type == "npu" and prefix_sum.numel() > 0:
-        mixed = apply_attn_res(prefix_sum, block_residual, projection, norm)
-    else:
-        values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
-        values_fp32 = values.float()
-        normalized, _ = torch_npu.npu_rms_norm(
-            values_fp32,
-            norm.weight.float(),
-            norm.variance_epsilon,
-        )
-        scores = torch.matmul(normalized, projection.weight.t().float()).squeeze(-1)
-        probabilities = scores.softmax(-1).unsqueeze(1)
-        mixed = torch.matmul(probabilities, values_fp32).squeeze(1).to(values.dtype)
+    """Apply the exact FSDPTurbo K3 residual-mixture arithmetic.
+
+    The v0.26 Triton fusion performs its own RMS reduction, projection
+    reduction, and softmax.  Those different reduction trees are not
+    numerically interchangeable with the actor path and the error is fed back
+    into every residual block.  Keep the same FP32 primitive boundaries as
+    FSDPTurbo and the already-aligned v0.23 rollout implementation.
+    """
+    values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
+    values_fp32 = values.float()
+    normalized, _ = torch_npu.npu_rms_norm(
+        values_fp32,
+        norm.weight.float(),
+        norm.variance_epsilon,
+    )
+    scores = torch.matmul(normalized, projection.weight.t().float()).squeeze(-1)
+    probabilities = scores.softmax(-1).unsqueeze(1)
+    mixed = torch.matmul(probabilities, values_fp32).squeeze(1).to(values.dtype)
     if _EXTRA_CTX.flash_comm_v1_enabled:
         # FlashComm changes the first decoder layer from the global token
         # layout to a TP-local layout.  The learned-residual arithmetic above
@@ -1344,9 +1334,6 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
         weights: Iterable[tuple[str, torch.Tensor] | tuple[str, torch.Tensor, dict[str, Any]]],
     ) -> set[str]:
         stacked_params_mapping = [
-            (".fused_qkv", ".q_proj", "q"),
-            (".fused_qkv", ".k_proj", "k"),
-            (".fused_qkv", ".v_proj", "v"),
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
             (".fused_qkv_a_proj", ".q_a_proj", 0),
@@ -1503,7 +1490,6 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
 
 class AscendKimiK3ForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid):
     packed_modules_mapping = {
-        "fused_qkv": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
         "experts": ["experts.0.w1", "experts.0.w3", "experts.0.w2"],
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
@@ -1647,7 +1633,20 @@ class KimiK3VisionPatchEmbed(nn.Module):
         )
 
     def forward(self, pixels: torch.Tensor, grid_thws: torch.Tensor | list[list[int]]) -> torch.Tensor:
-        hidden_states = self.proj(pixels).view(pixels.shape[0], -1)
+        # The patch-sized convolution has one output location.  Actor and
+        # rollout can keep equal BF16 values in different private NPU formats,
+        # so canonicalize both operands and evaluate the equivalent FP32 GEMM.
+        with torch.autocast(device_type=pixels.device.type, enabled=False):
+            flat_pixels = pixels.flatten(1).float()
+            flat_weight = self.proj.weight.flatten(1).float()
+            bias = None if self.proj.bias is None else self.proj.bias.float()
+            if pixels.device.type == "npu":
+                flat_pixels = _canonical_nd(flat_pixels)
+                flat_weight = _canonical_nd(flat_weight)
+                if bias is not None:
+                    bias = _canonical_nd(bias)
+            hidden_states = F.linear(flat_pixels, flat_weight, bias)
+        hidden_states = hidden_states.to(self.proj.weight.dtype)
         return self.pos_emb(hidden_states, grid_thws)
 
 
@@ -1790,7 +1789,7 @@ class KimiK3VisionEncoderLayer(nn.Module):
         query, key, value = qkv.unbind(dim=1)
         # QKVParallelLinear shards heads, while the shared RoPE table is head
         # independent and therefore needs no TP slicing.
-        query, key = apply_rope(query, key, rope_freqs_cis)
+        query, key = _apply_training_rope(query, key, rope_freqs_cis)
         output = self.attn(
             query.unsqueeze(0),
             key.unsqueeze(0),

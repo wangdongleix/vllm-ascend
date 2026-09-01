@@ -171,30 +171,49 @@ def test_zero_padded_spec_output_supports_multiple_real_and_dummy_rows():
     assert masked.device == output.device
 
 
-def test_output_norm_gate_uses_kda_fused_triton_kernel():
-    attention = AscendKimiGatedDeltaNetAttention.__new__(AscendKimiGatedDeltaNetAttention)
-    nn.Module.__init__(attention)
-    attention.o_norm = SimpleNamespace(
-        weight=nn.Parameter(torch.randn(3)),
-        eps=1e-6,
+def test_decode_causal_conv_uses_static_chunk_indices():
+    num_sequences = 2
+    width = 2
+    kernel_width = 4
+    mixed_qkv = torch.arange(
+        num_sequences * 3 * width,
+        dtype=torch.float32,
+    ).reshape(num_sequences, 3 * width)
+    conv_weights_t = torch.ones(kernel_width, 3 * width)
+    conv_state = torch.zeros(
+        num_sequences,
+        kernel_width - 1,
+        3 * width,
     )
-    core_attn_out = torch.randn(1, 4, 2, 3)
-    output_gate = torch.randn(4, 2, 3)
-    expected = torch.randn_like(core_attn_out)
+    metadata = SimpleNamespace(
+        query_start_loc=torch.arange(num_sequences + 1, dtype=torch.int32),
+        cache_indices=torch.arange(num_sequences),
+        initial_state_mode=None,
+    )
+
+    def fake_causal_conv1d(**kwargs):
+        return kwargs["x"], kwargs["initial_state"]
 
     with patch(
-        "vllm_ascend.ops.kimi_kda.apply_kda_rms_norm_sigmoid_gate",
-        return_value=expected,
-    ) as fused_norm_gate:
-        actual = attention._apply_output_norm_gate(core_attn_out, output_gate)
+        "vllm_ascend.ops.kimi_kda.training_causal_conv1d",
+        side_effect=fake_causal_conv1d,
+    ) as causal_conv:
+        output = AscendKimiGatedDeltaNetAttention._run_causal_conv1d(
+            mixed_qkv,
+            conv_weights_t,
+            conv_state,
+            metadata,
+            run_mode=1,
+        )
 
-    assert actual is expected
-    fused_norm_gate.assert_called_once_with(
-        core_attn_out,
-        output_gate,
-        attention.o_norm.weight,
-        attention.o_norm.eps,
-    )
+    torch.testing.assert_close(output, mixed_qkv)
+    expected_indices = torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
+    assert causal_conv.call_count == 3
+    for call in causal_conv.call_args_list:
+        torch.testing.assert_close(
+            call.kwargs["precomputed_chunk_indices"],
+            expected_indices,
+        )
 
 
 def test_conv_post_load_processing_packs_kernel_layout_in_place():

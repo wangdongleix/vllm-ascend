@@ -30,11 +30,7 @@ from vllm_ascend.transformers_utils.configs.kimi_k3 import (
 
 
 def test_kimi_k3_model_declares_checkpoint_packing_contract():
-    assert AscendKimiK3ForCausalLM.packed_modules_mapping["fused_qkv"] == [
-        "q_proj",
-        "k_proj",
-        "v_proj",
-    ]
+    assert "fused_qkv" not in AscendKimiK3ForCausalLM.packed_modules_mapping
     assert AscendKimiK3ForCausalLM.packed_modules_mapping["experts"] == [
         "experts.0.w1",
         "experts.0.w3",
@@ -42,17 +38,20 @@ def test_kimi_k3_model_declares_checkpoint_packing_contract():
     ]
 
 
-def test_kimi_k3_loads_qkv_checkpoint_shards_into_fused_linear():
+def test_kimi_k3_loads_qkv_checkpoint_shards_into_separate_linears():
     model = KimiK3TextModel.__new__(KimiK3TextModel)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(num_experts=0)
     model.layers = nn.ModuleList([nn.Module()])
     model.layers[0].self_attn = nn.Module()
-    model.layers[0].self_attn.fused_qkv = nn.Module()
-
-    fused_weight = nn.Parameter(torch.empty(1))
-    fused_weight.weight_loader = MagicMock()
-    model.layers[0].self_attn.fused_qkv.register_parameter("weight", fused_weight)
+    projection_weights = {}
+    for name in ("q_proj", "k_proj", "v_proj"):
+        projection = nn.Module()
+        weight = nn.Parameter(torch.empty(1))
+        weight.weight_loader = MagicMock()
+        projection.register_parameter("weight", weight)
+        setattr(model.layers[0].self_attn, name, projection)
+        projection_weights[name] = weight
     weights = [(f"layers.0.self_attn.{name}.weight", torch.empty(1)) for name in ("q_proj", "k_proj", "v_proj")]
 
     with (
@@ -62,8 +61,14 @@ def test_kimi_k3_loads_qkv_checkpoint_shards_into_fused_linear():
     ):
         loaded = model.load_weights(weights)
 
-    assert [call.args[2] for call in fused_weight.weight_loader.call_args_list] == ["q", "k", "v"]
-    assert loaded == {"layers.0.self_attn.fused_qkv.weight"}
+    for name, weight in projection_weights.items():
+        weight.weight_loader.assert_called_once()
+        assert weight.weight_loader.call_args.args[1] is weights[("q_proj", "k_proj", "v_proj").index(name)][1]
+    assert loaded == {
+        "layers.0.self_attn.q_proj.weight",
+        "layers.0.self_attn.k_proj.weight",
+        "layers.0.self_attn.v_proj.weight",
+    }
 
 
 @pytest.mark.parametrize(
