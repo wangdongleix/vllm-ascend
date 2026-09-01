@@ -70,6 +70,7 @@ class TestTorchNPUProfilerWrapper(TestBase):
             torch_profiler_dir="/path/to/traces",
             torch_profiler_with_stack=True,
             torch_profiler_with_memory=True,
+            torch_profiler_record_shapes=True,
         )
 
         mock_export_type.Text = "Text"
@@ -113,6 +114,7 @@ class TestTorchNPUProfilerWrapper(TestBase):
         profile_kwargs = mock_profile.call_args.kwargs
         self.assertEqual(profile_kwargs["activities"], ["CPU", "NPU"])
         self.assertTrue(profile_kwargs["profile_memory"])
+        self.assertTrue(profile_kwargs["record_shapes"])
         self.assertEqual(profile_kwargs["with_modules"], True)
         self.assertEqual(profile_kwargs["on_trace_ready"], mock_trace_handler_instance)
         self.assertEqual(result, mock_profiler_instance)
