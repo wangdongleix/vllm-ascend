@@ -2994,14 +2994,19 @@ class NPUModelRunner(GPUModelRunner):
                 # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
                 slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
                 blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
-            if self.model_config.enable_return_routed_experts and kv_cache_gid == 0:
+            if (
+                self.model_config.enable_return_routed_experts
+                and kv_cache_gid == self.routed_experts_attn_gid
+            ):
                 if self.routed_experts_initialized:
-                    # snapshot slot_mapping into a private device
-                    # buffer so the next ``_prepare_inputs`` does not
-                    # overwrite it while D2H is still pending.
-                    n = slot_mapping.shape[0]
-                    self.routed_experts_slot_mapping_device[:n].copy_(
-                        slot_mapping
+                    # The scheduler's RoutedExpertsManager indexes physical
+                    # slots from the first FullAttentionSpec group. Kimi K3
+                    # has hybrid KDA/full-attention KV groups, so group 0 is
+                    # not necessarily that group. Keep this selection exactly
+                    # aligned with GPUModelRunner._get_attention_kv_cache_gid
+                    # and copy only the real (unpadded) token rows.
+                    self.routed_experts_slot_mapping_device[:num_tokens].copy_(
+                        slot_mapping[:num_tokens]
                     )
             return blk_table_tensor, slot_mapping
 
@@ -3885,8 +3890,14 @@ class NPUModelRunner(GPUModelRunner):
 
         for module in self.compilation_config.static_forward_context.values():
             if isinstance(module, AscendMoERunner):
-                module._ascend_routed_experts_capturer = capturer
+                layer_id = module.layer_id
+                if layer_id is None:
+                    raise RuntimeError(
+                        "Cannot bind Ascend routed-expert capture: MoERunner "
+                        f"has no layer index (layer_name={module.layer_name!r})"
+                    )
                 module.routed_experts._ascend_routed_experts_capturer = capturer
+                module.routed_experts._ascend_routed_experts_layer_id = layer_id
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()
@@ -4306,6 +4317,15 @@ class NPUModelRunner(GPUModelRunner):
         return reshaped_kv_tensors
 
 
+    @staticmethod
+    def _view_kv_cache(raw_tensor: torch.Tensor, dtype: torch.dtype, shape: tuple[int, ...]) -> torch.Tensor:
+        cache = raw_tensor.view(dtype).view(shape)
+        if cache.storage_offset():
+            # CANN FIA rejects nonzero offsets in hybrid cache views. DLPack
+            # rebases the storage without copying and retains the shared owner.
+            cache = torch.utils.dlpack.from_dlpack(cache)
+        return cache
+
     def _reshape_kv_cache_tensors(
         self,
         kv_cache_config: KVCacheConfig,
@@ -4601,12 +4621,12 @@ class NPUModelRunner(GPUModelRunner):
                     if current_sparse_sfa_c8:
                         k_cache_dtype = self.c8_k_cache_dtype
 
-                    k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape)
+                    k_cache = self._view_kv_cache(raw_k_tensor, k_cache_dtype, k_shape)
                     if current_sparse_sfa_c8:
                         v_cache = None
                     else:
                         assert raw_v_tensor is not None
-                        v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape)
+                        v_cache = self._view_kv_cache(raw_v_tensor, v_cache_dtype, v_shape)
 
                     if current_sparse_sfa_c8:
                         kv_caches[layer_name] = (k_cache,)

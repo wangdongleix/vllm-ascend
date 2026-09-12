@@ -3,6 +3,8 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+import torch
+import torch_npu
 from vllm.config import (
     CacheConfig,
     CUDAGraphMode,
@@ -30,6 +32,55 @@ BLOCK_SIZE = 128
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
 FAKE_WEIGHT_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "_fake_weight")
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mla_cache_with_storage_offset_preserves_alias_and_decode(dtype):
+    """Hybrid cache slices must remain shared and be accepted by native FIA."""
+    num_blocks, block_size, heads, latent_dim, rope_dim = 4, 128, 16, 512, 64
+    padding_bytes = 4096
+    k_shape = (num_blocks, 1, block_size, latent_dim)
+    r_shape = (num_blocks, 1, block_size, rope_dim)
+    k_bytes = int(np.prod(k_shape)) * dtype.itemsize
+    r_bytes = int(np.prod(r_shape)) * dtype.itemsize
+    raw = torch.zeros(padding_bytes + k_bytes + r_bytes, dtype=torch.int8, device=DEVICE_TYPE)
+    raw_k = raw[padding_bytes : padding_bytes + k_bytes]
+    raw_r = raw[padding_bytes + k_bytes :]
+    k = NPUModelRunner._view_kv_cache(raw_k, dtype, k_shape)
+    kr = NPUModelRunner._view_kv_cache(raw_r, dtype, r_shape)
+    assert k.storage_offset() == kr.storage_offset() == 0
+    assert k.data_ptr() == raw_k.data_ptr()
+    assert kr.data_ptr() == raw_r.data_ptr()
+    k.copy_(torch.randn(k_shape, dtype=dtype, device=DEVICE_TYPE))
+    kr.copy_(torch.randn(r_shape, dtype=dtype, device=DEVICE_TYPE))
+    torch.testing.assert_close(raw_k.view(dtype).view(k_shape), k, rtol=0, atol=0)
+    torch.testing.assert_close(raw_r.view(dtype).view(r_shape), kr, rtol=0, atol=0)
+    k_ref, kr_ref = k.clone(), kr.clone()
+    del raw, raw_k, raw_r
+
+    q = torch.randn((1, heads, 1, latent_dim), dtype=dtype, device=DEVICE_TYPE)
+    qr = torch.randn((1, heads, 1, rope_dim), dtype=dtype, device=DEVICE_TYPE)
+    block_table = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32, device=DEVICE_TYPE)
+
+    def decode(key, key_rope):
+        return torch_npu.npu_fused_infer_attention_score_v2(
+            q,
+            key,
+            key,
+            query_rope=qr,
+            key_rope=key_rope,
+            num_query_heads=heads,
+            num_key_value_heads=1,
+            input_layout="BNSD_NBSD",
+            sparse_mode=0,
+            softmax_scale=(latent_dim + rope_dim) ** -0.5,
+            block_table=block_table,
+            block_size=block_size,
+            actual_seq_kvlen=[64],
+            return_softmax_lse=False,
+        )[0]
+
+    torch.testing.assert_close(decode(k, kr), decode(k_ref, kr_ref), rtol=0, atol=0)
 
 
 def initialize_kv_cache(runner: NPUModelRunner):

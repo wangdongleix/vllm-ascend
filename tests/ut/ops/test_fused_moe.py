@@ -13,6 +13,7 @@ from vllm_ascend.ops.fused_moe import fused_moe as fused_moe_module
 from vllm_ascend.ops.fused_moe.fused_moe import (
     AscendMoERunner,
     AscendUnquantizedFusedMoEMethod,
+    _capture_executed_routing,
     make_eplb_placement_config,
     use_multistage_eplb_load,
 )
@@ -21,8 +22,9 @@ from vllm_ascend.quantization.quant_type import QuantType
 
 def _build_weight_layer():
     return SimpleNamespace(
-        w13_weight=nn.Parameter(torch.randn(2, 3, 4)),
-        w2_weight=nn.Parameter(torch.randn(2, 4, 3)),
+        hidden_size=3,
+        w13_weight=nn.Parameter(torch.randn(2, 4, 3)),
+        w2_weight=nn.Parameter(torch.randn(2, 3, 4)),
     )
 
 
@@ -46,6 +48,35 @@ def _build_unquantized_method(*, dynamic_eplb: bool = False):
     method.moe = SimpleNamespace(has_bias=False)
     method._maybe_pad_weight = MagicMock(side_effect=lambda weight: weight)
     return method
+
+
+def test_capture_executed_routing_uses_v026_owner_layer_index():
+    capturer = MagicMock()
+    layer = SimpleNamespace(
+        _ascend_routed_experts_capturer=capturer,
+        _ascend_routed_experts_layer_id=7,
+    )
+    topk_ids = torch.tensor([[3, 5]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.25, 0.75]], dtype=torch.bfloat16)
+
+    _capture_executed_routing(layer, topk_ids, topk_weights)
+
+    capturer.capture.assert_called_once_with(
+        layer_id=7,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+    )
+
+
+def test_capture_executed_routing_rejects_missing_v026_owner_layer_index():
+    layer = SimpleNamespace(_ascend_routed_experts_capturer=MagicMock())
+
+    with pytest.raises(RuntimeError, match="without its owning MoERunner layer index"):
+        _capture_executed_routing(
+            layer,
+            torch.tensor([[3, 5]], dtype=torch.int32),
+            torch.tensor([[0.25, 0.75]], dtype=torch.bfloat16),
+        )
 
 
 def test_ascend_runner_prefers_runtime_situ_activation():
@@ -132,9 +163,7 @@ def test_ascend_unquantized_skips_upstream_modular_kernel_init():
     assert method.maybe_make_prepare_finalize() is None
 
 
-def test_process_weights_after_loading_uses_version_specific_layout(
-    monkeypatch,
-):
+def test_moe_reload_round_trip_preserves_runtime_layout(monkeypatch):
     method = _build_unquantized_method()
     layer = _build_weight_layer()
     w13_parameter = layer.w13_weight
@@ -165,6 +194,28 @@ def test_process_weights_after_loading_uses_version_specific_layout(
     assert layer.w2_weight is w2_parameter
     assert layer.w13_weight.weight_loader is w13_parameter.weight_loader
     assert layer.w2_weight.weight_loader is w2_parameter.weight_loader
+    runtime_w13_ptr = layer.w13_weight.data_ptr()
+    runtime_w2_ptr = layer.w2_weight.data_ptr()
+
+    method.prepare_weights_for_loading(layer)
+    torch.testing.assert_close(layer.w13_weight, original_w13)
+    torch.testing.assert_close(layer.w2_weight, original_w2)
+    assert layer.w13_weight.data_ptr() == runtime_w13_ptr
+    assert layer.w2_weight.data_ptr() == runtime_w2_ptr
+
+    reloaded_w13 = torch.randn_like(original_w13)
+    reloaded_w2 = torch.randn_like(original_w2)
+    with torch.no_grad():
+        layer.w13_weight.copy_(reloaded_w13)
+        layer.w2_weight.copy_(reloaded_w2)
+
+    method.process_weights_after_loading(layer)
+    torch.testing.assert_close(layer.w13_weight, reloaded_w13.transpose(1, 2))
+    torch.testing.assert_close(layer.w2_weight, reloaded_w2.transpose(1, 2))
+    assert layer.w13_weight is w13_parameter
+    assert layer.w2_weight is w2_parameter
+    assert layer.w13_weight.data_ptr() == runtime_w13_ptr
+    assert layer.w2_weight.data_ptr() == runtime_w2_ptr
 
 
 def test_ascend_runner_promotes_runtime_state_to_buffer():

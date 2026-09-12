@@ -16,73 +16,163 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+"""Ascend worker capture for complete Kimi full-model R3 payloads."""
 
 from __future__ import annotations
-
-import logging
 
 import torch
 import torch.distributed as dist
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
+from vllm.model_executor.layers.fused_moe import (
+    routed_experts_capturer as _upstream_routed_experts_capturer,
+)
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.patch.kimi_full_r3_schema import (
+    KIMI_FULL_R3_PACK_FACTOR,
+    install_kimi_full_r3_schema_patch,
+)
 
-logger = logging.getLogger(__name__)
+RoutedExpertsCapturer = _upstream_routed_experts_capturer.RoutedExpertsCapturer
+
+# Direct imports of the worker patch must be just as safe as normal plugin
+# startup.  This is idempotent and keeps worker and EngineCore schemas equal.
+install_kimi_full_r3_schema_patch()
 
 
-def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
-    """Capture expert routing decisions for a specific layer.
+def _tp_shard_layout(
+    *,
+    token_num_per_dp: int,
+    max_tokens: int,
+    local_rows: int,
+    tp_size: int,
+    moe_comm_type: MoECommType,
+) -> int | None:
+    """Return gathered row count when the router output is TP-sharded."""
+    if tp_size <= 1:
+        return None
 
-    Under data parallelism, ``topk_ids`` may have four different batch
-    layouts depending on where the DP combine happens and whether
-    Sequence Parallelism (SP) is active for the MoE layer:
-      - ``n == total`` (naive dispatch): all DP ranks' tokens are
-        concatenated before routing; we slice out this rank's span
-        using the cumulative per-rank counts.
-      - ``n == token_num_per_dp`` (modular-kernel path): DP combine
-        happens inside ``quant_method.apply``; ``select_experts`` only
-        ever sees this rank's tokens, so we take the whole tensor.
-      - ``n == total_with_padding`` (padded all-gather path): tokens are
-        padded to max_tokens before all-gather across DP group; each
-        DP rank occupies a contiguous block of size max_tokens, and we
-        extract only the actual tokens for this rank (skip padding).
-        When all DP ranks have equal token counts, ``total == total_with_padding``,
-        so the naive dispatch branch fires instead (equivalent result).
-      - ``n == ceil(token_num_per_dp / tp_size)`` (SP + modular-kernel
-        path): tokens were split along dim=0 across the TP group by
-        ``_sequence_parallel_context``
-        (``moe_runner_base.py:_sequence_parallel_context``), so each
-        TP rank only sees its shard. We all-gather along dim=0 to
-        reconstruct this DP rank's full routing tensor. SP pads with
-        ceil-div (see ``_compute_sp_num_tokens`` in
-        ``forward_context.py``), so the gathered tensor may contain a
-        few trailing padding rows which are trimmed by the downstream
-        ``[:token_num_per_dp]`` slice.
+    if moe_comm_type == MoECommType.ALLTOALL:
+        gathered_rows = max(token_num_per_dp, tp_size)
+        base, remainder = divmod(gathered_rows, tp_size)
+        expected_local_rows = {base}
+        if remainder:
+            expected_local_rows.add(base + 1)
+        return gathered_rows if local_rows in expected_local_rows else None
 
-    Args:
-        layer_id: The layer index.
-        topk_ids: Tensor of shape (batch_size, num_routed_experts).
-    """
+    if moe_comm_type in {MoECommType.MC2, MoECommType.FUSED_MC2}:
+        rows_per_rank = (max_tokens + tp_size - 1) // tp_size
+        return rows_per_rank * tp_size if local_rows == rows_per_rank else None
+
+    # ALLGATHER reconstructs the token dimension before expert selection.
+    return None
+
+
+def _gather_tp_shards(
+    payload: torch.Tensor,
+    *,
+    gathered_rows: int,
+    tp_size: int,
+) -> torch.Tensor:
+    gathered = torch.empty(
+        (gathered_rows, payload.shape[1]),
+        dtype=payload.dtype,
+        device=payload.device,
+    )
+    shards = torch.tensor_split(gathered, tp_size, dim=0)
+    dist.all_gather(list(shards), payload, get_tp_group().device_group)
+    return gathered
+
+
+def _pack_kimi_full_r3(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Pack executed IDs and exact BF16 weight bits into integer lanes."""
+    if topk_weights.shape != topk_ids.shape:
+        raise AssertionError(
+            "Kimi full R3 requires identical id/weight shapes, got "
+            f"ids={tuple(topk_ids.shape)}, weights={tuple(topk_weights.shape)}"
+        )
+    if topk_weights.dtype != torch.bfloat16:
+        raise TypeError(
+            f"Kimi full R3 wire schema is bit-exact only for executed BF16 router weights, got {topk_weights.dtype}"
+        )
+
+    # Ascend hosts are little-endian, so view(uint8) yields low/high bytes.
+    weight_bytes = topk_weights.contiguous().view(torch.uint8).reshape(*topk_weights.shape, 2)
+    return torch.cat(
+        (
+            topk_ids.to(torch.int32),
+            weight_bytes[..., 0].to(torch.int32),
+            weight_bytes[..., 1].to(torch.int32),
+        ),
+        dim=-1,
+    )
+
+
+def capture(
+    self,
+    layer_id: int,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor | None = None,
+) -> None:
+    """Capture the exact expert/weight pairs consumed by Ascend FusedMoE."""
+    actual_topk = int(topk_ids.shape[-1])
+    capture_width = int(self.device_buffer.shape[-1])
+    if capture_width == actual_topk * KIMI_FULL_R3_PACK_FACTOR:
+        if topk_weights is None:
+            raise RuntimeError(
+                "Kimi full R3 capture buffer is active but FusedMoE did not provide executed router weights"
+            )
+        routing_payload = _pack_kimi_full_r3(topk_ids, topk_weights)
+    elif capture_width == actual_topk:
+        routing_payload = topk_ids.to(torch.int32)
+    else:
+        raise AssertionError(
+            "RoutedExpertsCapturer buffer width is incompatible with router "
+            f"output: buffer={capture_width}, topk={actual_topk}"
+        )
 
     ctx = get_forward_context()
-    if ctx.dp_metadata is None:  # single dp
+    if ctx.dp_metadata is None:
+        # ctx.num_tokens is the full padded model-input length. Ascend's
+        # ALLTOALL/MC2 prepare path may already have split the routed tensor
+        # across TP ranks before expert selection, even with a single DP
+        # rank. Inferring the full row count from routing_payload would
+        # therefore copy only one TP shard and leave the remaining capture
+        # rows as zero/expert-0 placeholders.
+        token_num_per_dp = int(ctx.num_tokens)
+        max_tokens = token_num_per_dp
+        local_rows = int(routing_payload.shape[0])
         start_loc = 0
-        end_loc = topk_ids.shape[0]
-        token_num_per_dp = topk_ids.shape[0]
-    else:  # multi dp
+        end_loc = token_num_per_dp
+        if local_rows != token_num_per_dp:
+            gathered_rows = _tp_shard_layout(
+                token_num_per_dp=token_num_per_dp,
+                max_tokens=max_tokens,
+                local_rows=local_rows,
+                tp_size=self.tp_size,
+                moe_comm_type=_EXTRA_CTX.moe_comm_type,
+            )
+            if gathered_rows is None:
+                raise AssertionError(
+                    "RoutedExpertsCapturer: unexpected single-DP payload "
+                    f"batch dim {local_rows} (full={token_num_per_dp}, "
+                    f"tp_size={self.tp_size}, "
+                    f"moe_comm_type={_EXTRA_CTX.moe_comm_type})"
+                )
+            routing_payload = _gather_tp_shards(
+                routing_payload,
+                gathered_rows=gathered_rows,
+                tp_size=self.tp_size,
+            )
+    else:
         num_tokens_dp = ctx.dp_metadata.num_tokens_across_dp_cpu
         token_num_per_dp = int(num_tokens_dp[self.dp_rank].item())
         total = int(num_tokens_dp.sum().item())
-        n = topk_ids.shape[0]
-
-        # Calculate total with padding for all-gather scenario.
-        # When tokens are padded to max_tokens before all-gather across DP group,
-        # the total size becomes max_tokens * dp_size.
-        # Example: DP0 has 5 tokens, DP1 has 7 tokens, max_tokens=7.
-        # After padding: DP0 has 7 tokens, DP1 has 7 tokens.
-        # After all-gather: total_with_padding = 7 * 2 = 14.
+        n = routing_payload.shape[0]
         max_tokens = int(num_tokens_dp.max().item())
         total_with_padding = max_tokens * len(num_tokens_dp)
 
@@ -116,73 +206,50 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
             start_loc = self.dp_rank * max_tokens
             end_loc = start_loc + token_num_per_dp
         elif (
-            self.tp_size > 1
-            and n != token_num_per_dp
+            n != token_num_per_dp
             and (
-                # all2all scenario use tensor split, different tp rank have different
-                # size of tokens.
-                n == (token_num_per_dp + self.tp_size - 1) // self.tp_size
-                or n == token_num_per_dp // self.tp_size
-                # mc2 scenario will pad dp tokens to max_tokens and then ceil-div.
-                or n == (max_tokens + self.tp_size - 1) // self.tp_size
-            )
-        ):
-            # SP + modular-kernel path. All-gather across the TP
-            # group along dim=0 to reconstruct the full per-DP-rank
-            # tensor; keep only the first ``token_num_per_dp`` rows
-            # (trailing rows are SP ceil-div padding). The TP group
-            # is always initialized on real rollout workers, and
-            # every rank in the group reaches this branch in
-            # lockstep (bind is per-FusedMoE layer, SP is a global
-            # condition), so a bare all_gather here will not
-            # deadlock -- let it raise if the precondition is
-            # violated rather than skip silently.
-            #
-            # ``topk_ids`` is already whatever the router produced
-            # (typically int32/int64, both supported by NCCL); the
-            # downstream ``device_buffer[...] = topk_ids[...]``
-            # setitem narrows into int32 automatically.
-
-            # NOTE(Ronald1995): if total_num_per_dp == max_tokens,
-            # it will be both all2all and mc2 scenario.
-            # but we fires all2all scenario first.
-            # the result will be the same.
-            # all2all scenario in vllm-ascend.
-            if _EXTRA_CTX.moe_comm_type == MoECommType.ALLTOALL:
-                gather_topk_ids_shape = (
-                    (token_num_per_dp, topk_ids.shape[1])
-                    if token_num_per_dp >= self.tp_size
-                    else (self.tp_size, topk_ids.shape[1])
+                gathered_rows := _tp_shard_layout(
+                    token_num_per_dp=token_num_per_dp,
+                    max_tokens=max_tokens,
+                    local_rows=n,
+                    tp_size=self.tp_size,
+                    moe_comm_type=_EXTRA_CTX.moe_comm_type,
                 )
-            # mc2 scenario in vllm-ascend
-            else:
-                gather_topk_ids_shape = (n * self.tp_size, topk_ids.shape[1])
-
-            gather_topk_ids = torch.empty(
-                gather_topk_ids_shape,
-                dtype=topk_ids.dtype,
-                device=topk_ids.device,
             )
-            split_topk_ids = torch.tensor_split(gather_topk_ids, self.tp_size, dim=0)
-            dist.all_gather(list(split_topk_ids), topk_ids, get_tp_group().device_group)
-            topk_ids = gather_topk_ids
+            is not None
+        ):
+            routing_payload = _gather_tp_shards(
+                routing_payload,
+                gathered_rows=gathered_rows,
+                tp_size=self.tp_size,
+            )
             start_loc = 0
             end_loc = token_num_per_dp
         else:
             sp_expected = (token_num_per_dp + self.tp_size - 1) // self.tp_size if self.tp_size > 0 else -1
             raise AssertionError(
-                "RoutedExpertsCapturer: unexpected topk_ids batch "
-                f"dim {n} (expected {total}, {token_num_per_dp}, "
-                f"{total_with_padding}, or {sp_expected} for "
-                f"dp_rank={self.dp_rank}, tp_size={self.tp_size})"
+                "RoutedExpertsCapturer: unexpected payload batch dim "
+                f"{n} (expected {total}, {token_num_per_dp}, "
+                f"{total_with_padding}, or {sp_expected}; "
+                f"dp_rank={self.dp_rank}, tp_size={self.tp_size}, "
+                f"moe_comm_type={_EXTRA_CTX.moe_comm_type})"
             )
 
-    # Defensive: model may expose more layers than the capture buffer
-    # was sized for (unusual, but guards against miss-config).
-    if layer_id >= self.device_buffer.shape[1]:
-        return
+    if layer_id < 0 or layer_id >= self.device_buffer.shape[1]:
+        raise IndexError(
+            "RoutedExpertsCapturer layer_id is outside capture buffer: "
+            f"layer_id={layer_id}, layers={self.device_buffer.shape[1]}"
+        )
 
-    self.device_buffer[:token_num_per_dp, layer_id, :] = topk_ids[start_loc:end_loc, :]
+    selected = routing_payload[start_loc:end_loc, :]
+    if selected.shape != (token_num_per_dp, capture_width):
+        raise RuntimeError(
+            "Kimi full R3 capture slice is incomplete: "
+            f"selected={tuple(selected.shape)}, expected="
+            f"({token_num_per_dp}, {capture_width})"
+        )
+    self.device_buffer[:token_num_per_dp, layer_id, :] = selected
+
 
 
 RoutedExpertsCapturer.capture = capture
