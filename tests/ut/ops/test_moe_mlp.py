@@ -112,6 +112,45 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
         self.assertEqual(first_call.kwargs["weight"][0].shape, torch.Size([2, 16, 8]))
         self.assertEqual(second_call.kwargs["weight"][0].shape, torch.Size([2, 8, 8]))
 
+    def test_unquant_apply_mlp_uses_situ_between_grouped_matmuls(self):
+        hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
+        gate_up_out = torch.tensor(
+            [[-8.0, 1.0, -30.0, 40.0], [0.5, 7.0, -2.0, 3.0]],
+            dtype=torch.bfloat16,
+        )
+        down_out = torch.randn(2, 4, dtype=torch.bfloat16)
+        activation = SituActivationConfig(beta=4.0, linear_beta=25.0)
+        gate = gate_up_out[..., :2].float()
+        up = gate_up_out[..., 2:].float()
+        expected_activation = (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate) * (25.0 * torch.tanh(up / 25.0))).to(
+            gate_up_out.dtype
+        )
+
+        with (
+            patch(
+                "vllm_ascend.ops.fused_moe.moe_mlp.torch_npu.npu_grouped_matmul",
+                side_effect=[[gate_up_out], [down_out]],
+                create=True,
+            ) as mock_grouped_matmul,
+            patch(
+                "vllm_ascend.ops.fused_moe.moe_mlp.torch_npu.npu_swiglu",
+                create=True,
+            ) as mock_swiglu,
+        ):
+            output, _ = unquant_apply_mlp(
+                hidden_states=hidden_states,
+                w1=[torch.randn(1, 4, 4)],
+                w2=[torch.randn(1, 2, 4)],
+                group_list=torch.tensor([2]),
+                activation=activation,
+                need_trans=False,
+            )
+
+        self.assertTrue(output is down_out)
+        second_call = mock_grouped_matmul.call_args_list[1]
+        torch.testing.assert_close(second_call.kwargs["x"][0], expected_activation, rtol=0, atol=0)
+        mock_swiglu.assert_not_called()
+
     def test_w4a8_situ_preserves_packed_weight_scale_view_and_bias(self):
         hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
         quantized_input = torch.ones(2, 4, dtype=torch.int8)
@@ -844,8 +883,13 @@ class TestQuantApplyMlpNoGeluImpact(_GeluPathBase):
         mock_swiglu.assert_called()
 
     def test_swiglustep_activation_skips_gelu_path(self):
-        mock_gelu, _ = self._run_non_gelu(MoEActivation.SWIGLUSTEP)
+        with patch(
+            f"{MOE_MLP}.AscendSwigluStepAndMul.swiglustep_forward",
+            return_value=torch.zeros(1, 4),
+        ) as mock_swiglustep:
+            mock_gelu, _ = self._run_non_gelu(MoEActivation.SWIGLUSTEP)
         mock_gelu.assert_not_called()
+        mock_swiglustep.assert_called_once()
 
     def test_swigluoai_activation_skips_gelu_path(self):
         mock_gelu, _ = self._run_non_gelu(MoEActivation.SWIGLUOAI)

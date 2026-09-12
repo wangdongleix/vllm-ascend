@@ -14,8 +14,9 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
+import sys
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -31,6 +32,9 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_ascend.ops.kimi_kda import (
     _PACKED_CONV_WEIGHT_NAME,
     AscendKimiGatedDeltaNetAttention,
+    _additional_config_flag,
+    _graph_safe_cache_indices,
+    _graph_safe_cache_update,
     _load_a_log,
     _zero_padded_spec_output,
 )
@@ -42,6 +46,31 @@ class _NoopQuantMethod(QuantizeMethodBase):
 
     def apply(self, layer: nn.Module, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError
+
+
+def test_kimi_options_are_read_from_vllm_additional_config():
+    config = SimpleNamespace(additional_config={"kimi_training_causal_conv1d": True})
+
+    assert _additional_config_flag(config, "kimi_training_causal_conv1d")
+    assert not _additional_config_flag(config, "missing")
+    assert _additional_config_flag(SimpleNamespace(additional_config={"flag": 1}), "flag")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _additional_config_flag(SimpleNamespace(additional_config={"flag": "yes"}), "flag")
+    with pytest.raises(ValueError, match="must be a boolean"):
+        _additional_config_flag(SimpleNamespace(additional_config={"flag": 1.0}), "flag")
+
+
+def test_kimi_kda_format_cast_is_fake_tensor_safe():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        value = torch.empty(2, 3, 4, dtype=torch.bfloat16).transpose(0, 1)
+        result = torch.ops.vllm.kimi_kda_npu_format_cast_nd(value)
+
+    assert result.shape == value.shape
+    assert result.stride() == value.stride()
+    assert result.dtype == value.dtype
+    assert result.device == value.device
 
 
 def _make_conv_pack_attention(
@@ -169,6 +198,21 @@ def test_zero_padded_spec_output_supports_multiple_real_and_dummy_rows():
     assert masked.shape == output.shape
     assert masked.dtype == output.dtype
     assert masked.device == output.device
+
+
+def test_graph_safe_cache_update_uses_static_indices_and_preserves_padding():
+    cache_indices = torch.tensor([3, 5, -1, -1])
+    valid, safe_indices = _graph_safe_cache_indices(cache_indices)
+    assert torch.equal(valid, torch.tensor([True, True, False, False]))
+    assert torch.equal(safe_indices, torch.tensor([3, 5, 3, 3]))
+
+    cache = torch.zeros(8, 2, 3)
+    values = torch.arange(4 * 2 * 3, dtype=cache.dtype).reshape(4, 2, 3)
+    _graph_safe_cache_update(cache, safe_indices, valid, values)
+
+    torch.testing.assert_close(cache[3], values[0])
+    torch.testing.assert_close(cache[5], values[1])
+    assert torch.equal(cache[[0, 1, 2, 4, 6, 7]], torch.zeros(6, 2, 3))
 
 
 def test_output_norm_gate_uses_kda_fused_triton_kernel():
@@ -311,3 +355,39 @@ def test_kernel_format_reload_updates_named_packed_parameter():
 
     assert attention._conv_weights_t().data_ptr() == original_ptr
     torch.testing.assert_close(attention._conv_weights_t(), kernel_weight)
+
+
+@pytest.mark.parametrize("backend", ["fsdpturbo", "megatron"])
+@pytest.mark.parametrize("run_mode", [0, 1])
+def test_training_convolution_dispatch_preserves_cache_and_sequence_layout(backend, run_mode):
+    attention = _make_conv_pack_attention()
+    attention.use_training_causal_conv1d = True
+    attention.training_backend = backend
+    mixed = torch.arange(36, dtype=torch.float32).reshape(2, 18)
+    weights = torch.ones(4, 18)
+    cache = torch.ones(3, 3, 18)
+    metadata = SimpleNamespace(query_start_loc=torch.tensor([0, 1, 2]), cache_indices=torch.tensor([2, 0]))
+
+    def conv(*, x, weight, initial_state, activation, cu_seqlens, output_final_state):
+        assert x.shape == ((2, 1, 6) if run_mode else (1, 2, 6))
+        assert (cu_seqlens is None) == bool(run_mode)
+        assert activation == "silu" and output_final_state
+        torch.testing.assert_close(initial_state[..., 0], torch.zeros(2, 6))
+        torch.testing.assert_close(initial_state[..., 1:], torch.ones(2, 6, 3))
+        return x + 1, initial_state + 2
+
+    selected = Mock(side_effect=conv)
+    other = Mock(side_effect=AssertionError("wrong training backend"))
+    modules = {
+        "fsdp_turbo.ops.causal_conv1d": SimpleNamespace(causal_conv1d=selected if backend == "fsdpturbo" else other),
+        "mindspeed_ops.api.triton.convolution": SimpleNamespace(
+            causal_conv1d=selected if backend == "megatron" else other
+        ),
+    }
+    with patch.dict(sys.modules, modules):
+        output = attention._run_causal_conv1d(mixed, weights, cache, metadata, run_mode=run_mode)
+    torch.testing.assert_close(output, mixed + 1)
+    torch.testing.assert_close(cache[[2, 0]], torch.full((2, 3, 18), 3.0))
+    torch.testing.assert_close(cache[1], torch.ones(3, 18))
+    assert selected.call_count == 3
+    other.assert_not_called()

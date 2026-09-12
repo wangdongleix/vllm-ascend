@@ -26,9 +26,15 @@ from collections.abc import Callable
 from functools import partial, wraps
 
 import torch
+import torch_npu
 from einops import rearrange
+from torch.nn import functional as F
 from vllm.config import VllmConfig
-from vllm.distributed import get_pcp_group, get_tensor_model_parallel_rank
+from vllm.distributed import (
+    get_pcp_group,
+    get_tensor_model_parallel_rank,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import get_forward_context
 
 try:
@@ -39,9 +45,13 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelL
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     KimiGatedDeltaNetAttention,
 )
+from vllm.model_executor.model_loader.reload.meta import (
+    SKIP_TENSORS as _VLLM_LAYERWISE_RELOAD_SKIP_TENSORS,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import replace_parameter
 from vllm.triton_utils import HAS_TRITON
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -68,7 +78,62 @@ if HAS_TRITON:
 
 _KDA_CHUNK_SIZE = 64
 _PACKED_CONV_WEIGHT_NAME = "packed_conv_weights"
+# This tensor is derived from q/k/v convolution weights and has no checkpoint
+# entry.  Keeping it live lets every source-weight post-load hook refresh it;
+# otherwise layerwise reload counts it as an unloaded q_conv1d parameter and
+# can leave the Q slice from the dummy model in place.
+_VLLM_LAYERWISE_RELOAD_SKIP_TENSORS.add(_PACKED_CONV_WEIGHT_NAME)
 _FUSED_QKV_NAME = "fused_qkv"
+
+
+def _npu_format_cast_nd(input: torch.Tensor) -> torch.Tensor:
+    """Convert an NPU tensor to the base ND layout."""
+    return torch_npu.npu_format_cast(input, 2)
+
+
+def _npu_format_cast_nd_fake(input: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(input)
+
+
+direct_register_custom_op(
+    op_name="kimi_kda_npu_format_cast_nd",
+    op_func=_npu_format_cast_nd,
+    mutates_args=[],
+    fake_impl=_npu_format_cast_nd_fake,
+    dispatch_key="PrivateUse1",
+)
+
+
+def _graph_safe_cache_indices(cache_indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Replace graph-padding indices with the first real cache row."""
+    valid = cache_indices != PAD_SLOT_ID
+    fallback = cache_indices[:1].expand_as(cache_indices)
+    return valid, torch.where(valid, cache_indices, fallback)
+
+
+def _graph_safe_cache_update(
+    cache: torch.Tensor,
+    cache_indices: torch.Tensor,
+    valid: torch.Tensor,
+    values: torch.Tensor,
+) -> None:
+    """Update a static cache batch without graph-breaking boolean indexing."""
+    fallback = values[:1].expand_as(values)
+    values = torch.where(valid[:, None, None], values, fallback)
+    cache.index_copy_(0, cache_indices, values)
+
+
+def _additional_config_flag(
+    vllm_config: VllmConfig,
+    name: str,
+    default: bool = False,
+) -> bool:
+    value = (vllm_config.additional_config or {}).get(name, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise ValueError(f"additional_config.{name} must be a boolean, got {value!r}")
 
 
 def _zero_padded_spec_output(
@@ -167,28 +232,43 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
     def __init__(self, config, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(config, vllm_config, prefix)
 
+        self.use_training_causal_conv1d = _additional_config_flag(
+            vllm_config,
+            "kimi_training_causal_conv1d",
+        )
+        self.training_backend = (vllm_config.additional_config or {}).get("kimi_training_backend", "megatron")
+        if self.training_backend not in ("fsdpturbo", "megatron"):
+            raise ValueError("kimi_training_backend must be fsdpturbo or megatron")
+        self.use_fp32_output_projection = _additional_config_flag(
+            vllm_config,
+            "kimi_kda_oproj_fp32_reduce",
+        )
+
         kda_config = config.linear_attn_config
         assert kda_config is not None, "linear_attn_config must be set"
         self.use_full_rank_gate = bool(kda_config.get("use_full_rank_gate", False))
         gate_lower_bound = kda_config.get("gate_lower_bound")
         self.gate_lower_bound = float(gate_lower_bound) if gate_lower_bound is not None else None
 
-        # KDA uses the same hidden states and TP head layout for Q, K, and V.
-        # Pack their checkpoint shards into one standard QKV linear so MXFP8
-        # performs one dynamic quantization and one quantized matmul.
-        fused_qkv = QKVParallelLinear(
-            self.hidden_size,
-            self.head_dim,
-            self.num_heads,
-            self.num_heads,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.{_FUSED_QKV_NAME}",
-        )
-        del self.q_proj
-        del self.k_proj
-        del self.v_proj
-        self.fused_qkv = fused_qkv
+        # Quantized KDA needs one packed QKV projection so MXFP8 performs one
+        # dynamic quantization.  In ordinary BF16, retain the three upstream
+        # projections: the actor evaluates q/k/v independently and a fused NPU
+        # GEMM chooses different reduction tiling.
+        self.use_fused_qkv = self.quant_config is not None
+        if self.use_fused_qkv:
+            fused_qkv = QKVParallelLinear(
+                self.hidden_size,
+                self.head_dim,
+                self.num_heads,
+                self.num_heads,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.{_FUSED_QKV_NAME}",
+            )
+            del self.q_proj
+            del self.k_proj
+            del self.v_proj
+            self.fused_qkv = fused_qkv
 
         self.A_log.weight_loader = partial(
             _load_a_log,
@@ -265,9 +345,14 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
             not self.is_vl_first_layer,
         )
         num_tokens = hidden_states.size(0)
-        qkv = self.fused_qkv(hidden_states)[0]
-        projection_size = self.local_num_heads * self.head_dim
-        q, k, v = qkv.split([projection_size] * 3, dim=-1)
+        if self.use_fused_qkv:
+            qkv = self.fused_qkv(hidden_states)[0]
+            projection_size = self.local_num_heads * self.head_dim
+            q, k, v = qkv.split([projection_size] * 3, dim=-1)
+        else:
+            q = self.q_proj(hidden_states)[0]
+            k = self.k_proj(hidden_states)[0]
+            v = self.v_proj(hidden_states)[0]
 
         beta = self.b_proj(hidden_states)[0].float().sigmoid().unsqueeze(0)
         raw_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
@@ -295,7 +380,26 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         )
         core_attn_out = self._apply_output_norm_gate(core_attn_out, output_gate)
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
-        output[:] = self.o_proj(core_attn_out)[0]
+        output[:] = self._project_kda_output(core_attn_out)
+
+    def _project_kda_output(self, core_attn_out: torch.Tensor) -> torch.Tensor:
+        if not self.use_fp32_output_projection:
+            return self.o_proj(core_attn_out)[0]
+
+        projection = self.o_proj
+        if not projection.input_is_parallel:
+            raise RuntimeError("KDA FP32 o_proj parity path requires parallel input")
+        if projection.bias is not None:
+            raise RuntimeError("KDA FP32 o_proj parity path expects bias=False")
+        if not projection.reduce_results:
+            raise RuntimeError("KDA FP32 o_proj parity path requires TP reduction")
+
+        input_base = torch.ops.vllm.kimi_kda_npu_format_cast_nd(core_attn_out)
+        weight_base = torch.ops.vllm.kimi_kda_npu_format_cast_nd(projection.weight)
+        output_parallel = F.linear(input_base.float(), weight_base.float())
+        if projection.tp_size > 1:
+            output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+        return output_parallel.to(core_attn_out.dtype)
 
     def _apply_output_norm_gate(
         self,
@@ -311,8 +415,8 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
             )
         return self.o_norm(core_attn_out, output_gate)
 
-    @staticmethod
     def _run_causal_conv1d(
+        self,
         mixed_qkv: torch.Tensor,
         conv_weights_t: torch.Tensor,
         conv_state: torch.Tensor,
@@ -321,6 +425,121 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         run_mode: int,
         num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.use_training_causal_conv1d:
+            if num_accepted_tokens is not None:
+                raise RuntimeError("training-identical Kimi causal_conv1d does not support speculative decode")
+            if mixed_qkv.shape[-1] % 3:
+                raise RuntimeError("training-identical Kimi causal_conv1d requires equal q/k/v widths")
+            try:
+                if self.training_backend == "fsdpturbo":
+                    from fsdp_turbo.ops.causal_conv1d import causal_conv1d
+                else:
+                    from mindspeed_ops.api.triton.convolution import causal_conv1d
+            except ImportError as error:
+                raise RuntimeError(f"training-identical Kimi causal_conv1d requires {self.training_backend}") from error
+
+            query_start_loc = metadata.query_start_loc
+            cache_indices = metadata.cache_indices.reshape(-1)
+            num_sequences = query_start_loc.numel() - 1
+            if cache_indices.numel() != num_sequences:
+                raise RuntimeError(
+                    "training-identical Kimi causal_conv1d metadata mismatch: "
+                    f"cache_indices={cache_indices.numel()}, sequences={num_sequences}"
+                )
+
+            initial_state_mode = getattr(metadata, "initial_state_mode", None)
+            kernel_width = conv_weights_t.shape[0]
+            cached_state_width = conv_state.shape[1]
+            if cached_state_width != kernel_width - 1 or conv_state.shape[-1] != mixed_qkv.shape[-1]:
+                raise RuntimeError(
+                    "training-identical Kimi causal_conv1d cache shape mismatch: "
+                    f"cache={tuple(conv_state.shape)}, kernel={tuple(conv_weights_t.shape)}, "
+                    f"input={tuple(mixed_qkv.shape)}"
+                )
+
+            # Full-graph decode keeps real requests as a non-empty prefix and
+            # pads only the tail.  Map every padded row to the first real cache
+            # row; the write path below also gives those rows the same value,
+            # making duplicate writes deterministic and harmless.
+            valid_cache, safe_cache_indices = _graph_safe_cache_indices(cache_indices)
+            active_state = conv_state[safe_cache_indices].transpose(1, 2).contiguous()
+            if initial_state_mode is not None:
+                initial_state_mode = initial_state_mode.reshape(-1).bool()
+                if initial_state_mode.numel() != num_sequences:
+                    raise RuntimeError("training-identical Kimi causal_conv1d initial-state metadata mismatch")
+                active_state = torch.where(
+                    (initial_state_mode & valid_cache)[:, None, None],
+                    active_state,
+                    torch.zeros_like(active_state),
+                )
+                use_initial_state = run_mode != 0 or bool(initial_state_mode.any().item())
+            else:
+                use_initial_state = True
+
+            # MindSpeed's actor kernel stores W state elements, with the first
+            # element unused by a width-W causal convolution. vLLM caches only
+            # the W-1 effective history elements.
+            actor_state = torch.cat(
+                (active_state.new_zeros((*active_state.shape[:-1], 1)), active_state),
+                dim=-1,
+            )
+            part_width = mixed_qkv.shape[-1] // 3
+            outputs: list[torch.Tensor] = []
+            final_states: list[torch.Tensor] = []
+            # A regular decode batch has exactly one token per sequence.  Feed
+            # that case to MindSpeed as a dense [B, 1, D] batch instead of a
+            # varlen [1, B, D] batch.  The varlen implementation converts
+            # device lengths with .tolist(), which synchronizes the captured
+            # stream and is illegal during ACL graph capture.  Both layouts
+            # are numerically identical for one-token sequences; prefill keeps
+            # the original varlen path.
+            single_token_decode = run_mode != 0 and mixed_qkv.shape[0] == num_sequences
+            cu_seqlens = (
+                None
+                if single_token_decode
+                else query_start_loc.to(
+                    device=mixed_qkv.device,
+                    dtype=torch.int32,
+                )
+            )
+            for part in range(3):
+                start = part * part_width
+                end = start + part_width
+                part_input = mixed_qkv[:, start:end].unsqueeze(1 if single_token_decode else 0)
+                output, final_state = causal_conv1d(
+                    x=part_input,
+                    weight=conv_weights_t[:, start:end].contiguous(),
+                    initial_state=(actor_state[:, start:end].contiguous() if use_initial_state else None),
+                    activation="silu",
+                    cu_seqlens=cu_seqlens,
+                    output_final_state=True,
+                )
+                if final_state is None:
+                    raise RuntimeError("training-identical Kimi causal_conv1d did not return final state")
+                outputs.append(output)
+                final_states.append(final_state)
+
+            updated_state = (
+                torch.cat(final_states, dim=1)[..., -cached_state_width:]
+                .transpose(1, 2)
+                .contiguous()
+                .to(conv_state.dtype)
+            )
+            # Boolean indexing lowers to NonZero on Ascend, which synchronizes
+            # the stream and is illegal while an ACL graph is being captured.
+            # Keep both indices and values at the static capture-batch shape.
+            # Padded rows duplicate the first real row's exact update, so they
+            # neither require an arithmetic delta nor change cache semantics.
+            _graph_safe_cache_update(
+                conv_state,
+                safe_cache_indices,
+                valid_cache,
+                updated_state,
+            )
+
+            result = torch.cat(outputs, dim=-1)
+            return result.squeeze(1 if single_token_decode else 0)
+
         out = torch.empty_like(mixed_qkv)
         torch.ops._C_ascend.npu_causal_conv1d_custom(
             out,
