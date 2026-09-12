@@ -12,9 +12,15 @@ from vllm.multimodal.inputs import (
     MultiModalFlatField,
     MultiModalKwargsItems,
 )
-from vllm.multimodal.parse import ImageProcessorItems, MultiModalDataItems
+from vllm.multimodal.parse import (
+    MultiModalDataItems,
+    VisionChunkProcessorItems,
+)
+from vllm.multimodal.processing import BaseMultiModalProcessor
 
+import vllm_ascend.models.kimi_k3 as kimi_k3_module
 from vllm_ascend.models.kimi_k3 import (
+    AscendKimiK3ForConditionalGeneration,
     KimiK3DummyInputsBuilder,
     KimiK3MultiModalProcessor,
     KimiK3ProcessingInfo,
@@ -22,13 +28,67 @@ from vllm_ascend.models.kimi_k3 import (
 )
 from vllm_ascend.transformers_utils.processors.kimi_k3 import KimiK3Processor
 
-IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
-MEDIA_TOKEN = "<|media_pad|>"
+IMAGE_PLACEHOLDER = "<|media_begin|>image<|media_content|><|media_pad|><|media_end|>"
 MEDIA_TOKEN_ID = 163605
 
 
-def test_kimi_k3_processor_wraps_images_without_expanding_prompt():
+class _EmptyLoadedNamesLoader:
+    """Model the vLLM path that loads a nested Linear but omits its name."""
+
+    def __init__(self, *args, **kwargs):
+        del args, kwargs
+
+    def load_weights(self, weights, mapper):
+        del mapper
+        list(weights)
+        return set()
+
+
+def _projector_load_test_model(*, use_rot_proj: bool):
+    model = object.__new__(AscendKimiK3ForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        use_rot_proj=False,
+        vision_config=SimpleNamespace(use_rot_proj=use_rot_proj),
+    )
+    model.mm_projector = torch.nn.Module()
+    if use_rot_proj:
+        model.mm_projector.rot_proj = torch.nn.Linear(2, 2, bias=False)
+    return model
+
+
+def test_kimi_k3_load_keeps_configured_rot_proj_when_loader_omits_name(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kimi_k3_module,
+        "AutoWeightsLoader",
+        _EmptyLoadedNamesLoader,
+    )
+    model = _projector_load_test_model(use_rot_proj=True)
+
+    assert model.load_weights([]) == set()
+    assert isinstance(model.mm_projector.rot_proj, torch.nn.Linear)
+
+
+def test_kimi_k3_load_preserves_absent_unconfigured_rot_proj(monkeypatch):
+    monkeypatch.setattr(
+        kimi_k3_module,
+        "AutoWeightsLoader",
+        _EmptyLoadedNamesLoader,
+    )
+    model = _projector_load_test_model(use_rot_proj=False)
+
+    assert model.load_weights([]) == set()
+    assert not hasattr(model.mm_projector, "rot_proj")
+
+
+def test_kimi_k3_processor_consumes_vision_chunks_without_expanding_prompt():
     images = [object(), object()]
+    vision_chunks = [
+        {"type": "image", "image": images[0]},
+        {"type": "image", "image": images[1]},
+    ]
     image_processor = SimpleNamespace(
         preprocess=MagicMock(
             return_value={
@@ -47,16 +107,12 @@ def test_kimi_k3_processor_wraps_images_without_expanding_prompt():
 
     outputs = processor(
         text=f"before {IMAGE_PLACEHOLDER} after",
-        images=images,
+        vision_chunks=vision_chunks,
         return_tensors=None,
     )
 
     image_processor.preprocess.assert_called_once()
-    media_arg = image_processor.preprocess.call_args.args[0]
-    assert media_arg == [
-        {"type": "image", "image": images[0]},
-        {"type": "image", "image": images[1]},
-    ]
+    assert image_processor.preprocess.call_args.args[0] is vision_chunks
     assert image_processor.preprocess.call_args.kwargs == {
         "return_tensors": None,
     }
@@ -67,7 +123,10 @@ def test_kimi_k3_processor_wraps_images_without_expanding_prompt():
     assert outputs["attention_mask"] == [[1, 1, 1]]
 
 
-def test_kimi_k3_multimodal_fields_use_image_modality_and_grid_slices():
+def test_kimi_k3_multimodal_fields_use_vision_chunk_and_grid_slices():
+    # The generic MM-only helper handles image/video/audio, not vision_chunk.
+    # This override selects vLLM's text+MM path and must not be deduplicated.
+    assert KimiK3MultiModalProcessor._call_hf_processor is not BaseMultiModalProcessor._call_hf_processor
     processor = object.__new__(KimiK3MultiModalProcessor)
     grid_thws = torch.tensor([[1, 2, 3], [2, 3, 4]])
 
@@ -87,12 +146,12 @@ def test_kimi_k3_multimodal_fields_use_image_modality_and_grid_slices():
     )
 
     pixel_values = fields["pixel_values"]
-    assert pixel_values.modality == "image"
+    assert pixel_values.modality == "vision_chunk"
     assert isinstance(pixel_values.field, MultiModalFlatField)
     assert [(int(item[0].start), int(item[0].stop)) for item in pixel_values.field.slices] == [(0, 6), (6, 30)]
 
     grid = fields["grid_thws"]
-    assert grid.modality == "image"
+    assert grid.modality == "vision_chunk"
     assert isinstance(grid.field, MultiModalBatchedField)
     assert grid.field.keep_on_cpu is True
 
@@ -100,17 +159,20 @@ def test_kimi_k3_multimodal_fields_use_image_modality_and_grid_slices():
 def test_kimi_k3_prompt_update_expands_original_image_size_and_media_pads():
     image = Image.new("RGB", (640, 480))
     media_tokens_calculator = MagicMock(return_value=3)
+    tokenizer = MagicMock()
+    tokenizer.encode.side_effect = lambda text, add_special_tokens=False: {
+        "<|media_begin|>image<|media_content|>": [10],
+        "<|media_begin|>image 640x480<|media_content|>": [20],
+        "<|media_end|>": [11],
+    }[text]
     processor = object.__new__(KimiK3MultiModalProcessor)
     processor.info = SimpleNamespace(
         media_token_id=MEDIA_TOKEN_ID,
-        media_token=MEDIA_TOKEN,
         media_tokens_calculator=media_tokens_calculator,
-        get_hf_config=lambda: SimpleNamespace(
-            image_placeholder=IMAGE_PLACEHOLDER,
-        ),
+        get_tokenizer=lambda: tokenizer,
     )
     mm_items = MultiModalDataItems(
-        {"image": ImageProcessorItems([image])},
+        {"vision_chunk": VisionChunkProcessorItems([{"type": "image", "image": image}])},
     )
 
     updates = processor._get_prompt_updates(
@@ -121,19 +183,17 @@ def test_kimi_k3_prompt_update_expands_original_image_size_and_media_pads():
 
     assert len(updates) == 1
     update = updates[0]
-    assert update.modality == "image"
-    assert update.target == IMAGE_PLACEHOLDER
+    assert update.modality == "vision_chunk"
+    assert update.target == [10, MEDIA_TOKEN_ID, 11]
     assert callable(update.replacement)
 
     details = update.replacement(0)
-    assert details.full == (f"<|media_begin|>image 640x480<|media_content|>{MEDIA_TOKEN * 3}<|media_end|>")
+    assert details.full == [20, MEDIA_TOKEN_ID, MEDIA_TOKEN_ID, MEDIA_TOKEN_ID, 11]
     media_tokens_calculator.assert_called_once()
     media = media_tokens_calculator.call_args.args[0]
     assert media["type"] == "image"
     assert media["image"] is image
 
-    tokenizer = MagicMock()
-    tokenizer.encode.return_value = [10, MEDIA_TOKEN_ID, MEDIA_TOKEN_ID, MEDIA_TOKEN_ID, 11]
     assert details.is_embed is not None
     assert details.is_embed(tokenizer, details.full).tolist() == [
         False,
@@ -176,21 +236,24 @@ def test_kimi_k3_dummy_builder_profiles_true_maximum_image_shape():
                 "fixed_output_tokens": None,
             }
         ),
-        get_hf_config=lambda: SimpleNamespace(
-            image_placeholder=IMAGE_PLACEHOLDER,
-        ),
         get_max_image_size=KimiK3ProcessingInfo.get_max_image_size,
     )
     builder = KimiK3DummyInputsBuilder(info)
     builder._get_dummy_images = MagicMock(return_value=["image-0", "image-1"])
     options = ImageDummyOptions(count=2, width=640, height=480)
 
-    assert builder.get_dummy_text({"image": 2}) == IMAGE_PLACEHOLDER * 2
+    assert KimiK3ProcessingInfo.get_supported_mm_limits(object()) == {"vision_chunk": None}
+    assert builder.get_dummy_text({"vision_chunk": 2}) == IMAGE_PLACEHOLDER * 2
     assert builder.get_dummy_mm_data(
         seq_len=4096,
-        mm_counts={"image": 2},
-        mm_options={"image": options},
-    ) == {"image": ["image-0", "image-1"]}
+        mm_counts={"vision_chunk": 2},
+        mm_options={"vision_chunk": options},
+    ) == {
+        "vision_chunk": [
+            {"type": "image", "image": "image-0"},
+            {"type": "image", "image": "image-1"},
+        ]
+    }
     builder._get_dummy_images.assert_called_once_with(
         height=7041,
         width=1861,

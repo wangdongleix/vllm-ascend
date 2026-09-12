@@ -61,6 +61,11 @@ class KimiK3TextConfig(KimiLinearConfig):
         self.routed_expert_hidden_size = routed_expert_hidden_size
         self.topk_method = topk_method
 
+    @property
+    def num_experts_per_tok(self) -> int:
+        """Expose Kimi's top-k under vLLM's routed-experts field name."""
+        return self.num_experts_per_token
+
 
 class K3DSparkConfig(PretrainedConfig):
     """Configuration contract for Kimi K3 MLA DSpark checkpoints."""
@@ -180,13 +185,9 @@ class KimiK3Config(PretrainedConfig):
         media_placeholder_token_id: int = 163605,
         pad_token_id: int = 0,
         image_placeholder: str = "<|kimi_image_placeholder|>",
+        use_unified_vision_chunk: bool = True,
         **kwargs: Any,
     ) -> None:
-        # K3 now exposes the standard image modality. Ignore serialized
-        # plugin-era configs that would otherwise remap images to
-        # ``vision_chunk`` in vLLM's chat frontend.
-        kwargs.pop("use_unified_vision_chunk", None)
-
         if text_config is None:
             text_config = KimiK3TextConfig()
         elif isinstance(text_config, dict):
@@ -211,6 +212,9 @@ class KimiK3Config(PretrainedConfig):
         self.ignore_index = ignore_index
         self.media_placeholder_token_id = media_placeholder_token_id
         self.image_placeholder = image_placeholder
+        # vLLM's OpenAI renderer maps standard image content onto the unified
+        # ``vision_chunk`` modality registered by the K3 plugin.
+        self.use_unified_vision_chunk = use_unified_vision_chunk
 
         # Compressed-tensors configuration lives in the nested text config in
         # the released checkpoint, while vLLM discovers it on the top level.

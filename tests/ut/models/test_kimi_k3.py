@@ -42,17 +42,20 @@ def test_kimi_k3_model_declares_checkpoint_packing_contract():
     ]
 
 
-def test_kimi_k3_loads_qkv_checkpoint_shards_into_fused_linear():
+def test_kimi_k3_loads_qkv_checkpoint_shards_into_separate_linears():
     model = KimiK3TextModel.__new__(KimiK3TextModel)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(num_experts=0)
     model.layers = nn.ModuleList([nn.Module()])
     model.layers[0].self_attn = nn.Module()
-    model.layers[0].self_attn.fused_qkv = nn.Module()
-
-    fused_weight = nn.Parameter(torch.empty(1))
-    fused_weight.weight_loader = MagicMock()
-    model.layers[0].self_attn.fused_qkv.register_parameter("weight", fused_weight)
+    projection_weights = {}
+    for name in ("q_proj", "k_proj", "v_proj"):
+        projection = nn.Module()
+        weight = nn.Parameter(torch.empty(1))
+        weight.weight_loader = MagicMock()
+        projection.register_parameter("weight", weight)
+        setattr(model.layers[0].self_attn, name, projection)
+        projection_weights[name] = weight
     weights = [(f"layers.0.self_attn.{name}.weight", torch.empty(1)) for name in ("q_proj", "k_proj", "v_proj")]
 
     with (
@@ -62,8 +65,14 @@ def test_kimi_k3_loads_qkv_checkpoint_shards_into_fused_linear():
     ):
         loaded = model.load_weights(weights)
 
-    assert [call.args[2] for call in fused_weight.weight_loader.call_args_list] == ["q", "k", "v"]
-    assert loaded == {"layers.0.self_attn.fused_qkv.weight"}
+    for name, weight in projection_weights.items():
+        weight.weight_loader.assert_called_once()
+        assert weight.weight_loader.call_args.args[1] is weights[("q_proj", "k_proj", "v_proj").index(name)][1]
+    assert loaded == {
+        "layers.0.self_attn.q_proj.weight",
+        "layers.0.self_attn.k_proj.weight",
+        "layers.0.self_attn.v_proj.weight",
+    }
 
 
 @pytest.mark.parametrize(
@@ -106,84 +115,43 @@ def test_kimi_k3_projector_registers_rotation_for_weight_loading(
     monkeypatch.setattr(kimi_k3, "ReplicatedLinear", StubReplicatedLinear)
     monkeypatch.setattr(kimi_k3, "RMSNorm", lambda *args, **kwargs: nn.Identity())
     monkeypatch.setattr(kimi_k3, "get_act_fn", lambda *args, **kwargs: nn.Identity())
+    monkeypatch.setattr(
+        kimi_k3,
+        "is_vit_use_data_parallel",
+        lambda num_heads: False,
+    )
     config = KimiK3VisionConfig(
         mm_hidden_size=2,
         text_hidden_size=8,
         merge_kernel_size=(2, 2),
+        use_rot_proj=True,
     )
     projector = KimiK3MultiModalProjector(config)
 
     assert projector.rot_proj is not None
 
 
-@pytest.mark.parametrize(
-    ("loaded_weights", "has_rot_proj"),
-    [
-        ({"mm_projector.rot_proj.weight"}, True),
-        ({"mm_projector.linear_1.weight"}, False),
-    ],
-)
-def test_kimi_k3_enables_projector_rotation_only_when_weight_is_loaded(
-    monkeypatch: pytest.MonkeyPatch,
-    loaded_weights: set[str],
-    has_rot_proj: bool,
-):
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_kimi_k3_bucketed_reload_preserves_configured_rotation(monkeypatch, wrapped):
+    loaded_weights = {"mm_projector.linear_1.weight"}
+
     class StubLoader:
-        def __init__(self, model, *, skip_prefixes):
+        def __init__(self, model):
             assert model is wrapper
-            assert skip_prefixes == []
 
         def load_weights(self, weights, *, mapper):
-            assert list(weights) == []
-            assert mapper is wrapper.hf_to_vllm_mapper
             return loaded_weights
 
     monkeypatch.setattr(kimi_k3, "AutoWeightsLoader", StubLoader)
     wrapper = AscendKimiK3ForConditionalGeneration.__new__(AscendKimiK3ForConditionalGeneration)
     nn.Module.__init__(wrapper)
-    wrapper.mm_projector = nn.Module()
-    wrapper.mm_projector.rot_proj = nn.Linear(1, 1, bias=False)
-
-    actual = wrapper.load_weights(iter(()))
-
-    assert actual == loaded_weights
-    assert hasattr(wrapper.mm_projector, "rot_proj") is has_rot_proj
-    assert ("mm_projector.rot_proj.weight" in dict(wrapper.named_parameters())) is has_rot_proj
-
-
-def test_kimi_k3_deletes_unused_rot_proj_when_projector_is_placeholder(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    # Text-only serving (--language-model-only, or --limit-mm-per-prompt at 0
-    # for all tower modalities) wraps tower components in StageMissingLayer.
-    # Its __getattr__ delegates to the wrapped projector, but del acts on the
-    # placeholder's own registries (empty by design), so deleting
-    # mm_projector.rot_proj directly raises AttributeError. The deletion must
-    # target the wrapped module instead.
-    class StubLoader:
-        def __init__(self, model, *, skip_prefixes):
-            assert model is wrapper
-            assert skip_prefixes == []
-
-        def load_weights(self, weights, *, mapper):
-            assert list(weights) == []
-            assert mapper is wrapper.hf_to_vllm_mapper
-            return {"mm_projector.linear_1.weight"}
-
-    monkeypatch.setattr(kimi_k3, "AutoWeightsLoader", StubLoader)
-    wrapper = AscendKimiK3ForConditionalGeneration.__new__(AscendKimiK3ForConditionalGeneration)
-    nn.Module.__init__(wrapper)
     projector = nn.Module()
-    projector.rot_proj = nn.Linear(1, 1, bias=False)
-    wrapper.mm_projector = StageMissingLayer("vision_tower", projector)
-
-    actual = wrapper.load_weights(iter(()))
-
-    assert actual == {"mm_projector.linear_1.weight"}
-    # The unused rotation was released from the wrapped projector...
-    assert hasattr(projector, "rot_proj") is False
-    # ...and lookups through the placeholder no longer find it either.
-    assert hasattr(wrapper.mm_projector, "rot_proj") is False
+    rotation = nn.Linear(1, 1, bias=False)
+    projector.rot_proj = rotation
+    wrapper.mm_projector = StageMissingLayer("vision_tower", projector) if wrapped else projector
+    for _ in range(2):
+        assert wrapper.load_weights(iter(())) == loaded_weights
+        assert projector.rot_proj is rotation
 
 
 def test_kimi_k3_projector_applies_rotation_only_after_weight_load():
@@ -198,6 +166,7 @@ def test_kimi_k3_projector_applies_rotation_only_after_weight_load():
     projector = KimiK3MultiModalProjector.__new__(KimiK3MultiModalProjector)
     nn.Module.__init__(projector)
     projector.input_size = 2
+    projector.use_native_linear = False
     projector.linear_1 = PassthroughLinear()
     projector.linear_2 = PassthroughLinear()
     projector.act = nn.Identity()
@@ -205,8 +174,8 @@ def test_kimi_k3_projector_applies_rotation_only_after_weight_load():
     image_features = torch.tensor([[1.0, 2.0]])
 
     projector.rot_proj = ScaleLinear()
-    del projector.rot_proj
-    assert not hasattr(projector, "rot_proj")
+    projector.rot_proj = None
+    assert projector.rot_proj is None
     torch.testing.assert_close(projector(image_features), image_features)
 
     projector.rot_proj = ScaleLinear()
@@ -232,6 +201,16 @@ def test_kimi_k3_projector_applies_rotation_only_after_weight_load():
             "layers.1.experts.w2_weight_packed",
         ),
         (
+            "layers.1.experts.w13_weight",
+            {"layers.1.experts.routed_experts.w13_weight": object()},
+            "layers.1.experts.routed_experts.w13_weight",
+        ),
+        (
+            "layers.1.experts.w2_weight",
+            {"layers.1.experts.routed_experts.w2_weight_packed": object()},
+            "layers.1.experts.routed_experts.w2_weight_packed",
+        ),
+        (
             "layers.1.experts.w13_weight_scale",
             {"layers.1.experts.w13_weight_packed": object()},
             "layers.1.experts.w13_weight_scale",
@@ -244,6 +223,73 @@ def test_kimi_k3_resolves_packed_expert_checkpoint_names(
     expected: str,
 ):
     assert _resolve_packed_expert_weight_name(name, params) == expected
+
+
+def test_kimi_k3_loads_verl_packed_local_experts_into_v026_routed_experts():
+    model = KimiK3TextModel.__new__(KimiK3TextModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(num_experts=32)
+    model.layers = nn.ModuleList([nn.Module(), nn.Module()])
+    moe = nn.Module()
+    moe.experts = nn.Module()
+    moe.experts.routed_experts = nn.Module()
+    model.layers[1].block_sparse_moe = moe
+
+    w13_weight = nn.Parameter(torch.empty(1))
+    w2_weight = nn.Parameter(torch.empty(1))
+    w13_weight.weight_loader = MagicMock(return_value=True)
+    w2_weight.weight_loader = MagicMock(return_value=True)
+    moe.experts.routed_experts.register_parameter("w13_weight", w13_weight)
+    moe.experts.routed_experts.register_parameter("w2_weight", w2_weight)
+
+    gate_up = torch.arange(4 * 3 * 10, dtype=torch.float32).view(4, 3, 10)
+    down = torch.arange(4 * 5 * 3, dtype=torch.float32).view(4, 5, 3)
+    weights = [
+        (
+            "layers.1.block_sparse_moe.experts.gate_up_proj.__verl_packed_local__.8",
+            gate_up,
+        ),
+        (
+            "layers.1.block_sparse_moe.experts.down_proj.__verl_packed_local__.8",
+            down,
+        ),
+    ]
+
+    with patch(
+        "vllm_ascend.models.kimi_k3.fused_moe_make_expert_params_mapping",
+        return_value=[],
+    ):
+        loaded = model.load_weights(weights)
+
+    expected_prefix = "layers.1.block_sparse_moe.experts.routed_experts"
+    assert loaded == {
+        f"{expected_prefix}.w13_weight",
+        f"{expected_prefix}.w2_weight",
+    }
+    assert [call.kwargs["expert_id"] for call in w13_weight.weight_loader.call_args_list] == [
+        8,
+        8,
+        9,
+        9,
+        10,
+        10,
+        11,
+        11,
+    ]
+    assert [call.kwargs["shard_id"] for call in w13_weight.weight_loader.call_args_list] == ["w1", "w3"] * 4
+    assert [call.kwargs["expert_id"] for call in w2_weight.weight_loader.call_args_list] == [8, 9, 10, 11]
+    torch.testing.assert_close(
+        w13_weight.weight_loader.call_args_list[0].args[1],
+        gate_up[0, :, :5].t().contiguous(),
+    )
+    torch.testing.assert_close(
+        w13_weight.weight_loader.call_args_list[1].args[1],
+        gate_up[0, :, 5:].t().contiguous(),
+    )
+    torch.testing.assert_close(
+        w2_weight.weight_loader.call_args_list[0].args[1],
+        down[0].t().contiguous(),
+    )
 
 
 def test_kimi_k3_config_normalizes_checkpoint_schema_for_vllm():
@@ -260,8 +306,9 @@ def test_kimi_k3_config_normalizes_checkpoint_schema_for_vllm():
         use_unified_vision_chunk=True,
     )
 
-    # Old plugin checkpoints used vision_chunk, while vLLM consumes image.
-    assert not hasattr(config, "use_unified_vision_chunk")
+    # vLLM's renderer must normalize standard image content to the same
+    # vision_chunk modality consumed by verl's Kimi adapter.
+    assert config.use_unified_vision_chunk is True
     # MoonViT consumers use canonical names instead of checkpoint vt_* names.
     assert config.vision_config.num_attention_heads == 12
     assert config.vision_config.hidden_size == 1024
@@ -269,8 +316,8 @@ def test_kimi_k3_config_normalizes_checkpoint_schema_for_vllm():
     assert config.vision_config.text_hidden_size == config.text_config.hidden_size
 
 
-def test_kimi_k3_model_uses_image_placeholder_from_upstream_contract():
-    assert AscendKimiK3ForConditionalGeneration.get_placeholder_str("image", 0) == "<|kimi_image_placeholder|>"
+def test_kimi_k3_model_uses_unified_vision_chunk_placeholder():
+    assert AscendKimiK3ForConditionalGeneration.get_placeholder_str("image", 0) == ("<|media_begin|>image<|media_content|><|media_pad|><|media_end|>")
     with pytest.raises(ValueError, match="does not support modality"):
         AscendKimiK3ForConditionalGeneration.get_placeholder_str(
             "vision_chunk",
@@ -381,54 +428,13 @@ def test_kimi_k3_vision_tp16_falls_back_to_data_parallel(
     assert layer.use_data_parallel is True
     assert layer.tp_size == 1
     assert layer.num_local_heads == 12
-    assert qkv_kwargs["disable_tp"] is True
-    assert output_kwargs["disable_tp"] is True
-
-
-def test_kimi_k3_vit_dp_compat_calls_release_helper_without_num_heads(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    calls: list[None] = []
-
-    def release_helper():
-        calls.append(None)
-        return False
-
-    monkeypatch.setattr(kimi_k3, "vllm_version_is", lambda version: version == "0.25.1")
-    monkeypatch.setattr(kimi_k3, "get_tensor_model_parallel_world_size", lambda: 4)
-    monkeypatch.setattr(kimi_k3, "is_vit_use_data_parallel", release_helper)
-
-    assert kimi_k3._is_vit_use_data_parallel(8) is False
-    assert calls == [None]
-
-
-def test_kimi_k3_vit_dp_compat_recreates_release_tp_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    def unexpected_release_helper():
-        pytest.fail("The release helper must not run after the TP fallback")
-
-    monkeypatch.setattr(kimi_k3, "vllm_version_is", lambda version: version == "0.25.1")
-    monkeypatch.setattr(kimi_k3, "get_tensor_model_parallel_world_size", lambda: 16)
-    monkeypatch.setattr(kimi_k3, "is_vit_use_data_parallel", unexpected_release_helper)
-
-    assert kimi_k3._is_vit_use_data_parallel(12) is True
-
-
-def test_kimi_k3_vit_dp_compat_passes_num_heads_to_main_helper(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    calls = []
-
-    def main_helper(num_heads):
-        calls.append(num_heads)
-        return True
-
-    monkeypatch.setattr(kimi_k3, "vllm_version_is", lambda version: False)
-    monkeypatch.setattr(kimi_k3, "is_vit_use_data_parallel", main_helper)
-
-    assert kimi_k3._is_vit_use_data_parallel(12) is True
-    assert calls == [12]
+    assert layer.use_native_linear is True
+    assert isinstance(layer.wqkv, nn.Linear)
+    assert isinstance(layer.wo, nn.Linear)
+    # vLLM 0.26's data-parallel vision path uses ordinary torch linears;
+    # sharded vLLM linears (and their legacy disable_tp kwarg) are bypassed.
+    assert qkv_kwargs == {}
+    assert output_kwargs == {}
 
 
 def test_kimi_k3_skips_explicit_move_for_meta_modules():
@@ -631,3 +637,29 @@ def test_kimi_k3_dspark_aux_capture_mode_is_forwarded():
     wrapper.set_dspark_aux_capture_materialized(True)
 
     wrapper.language_model.set_dspark_aux_capture_materialized.assert_called_once_with(True)
+
+
+def test_kimi_k3_loads_quantized_qkv_into_fused_projection():
+    model = KimiK3TextModel.__new__(KimiK3TextModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(num_experts=0)
+    model.layers = nn.ModuleList([nn.Module()])
+    model.layers[0].self_attn = nn.Module()
+    model.layers[0].self_attn.fused_qkv = nn.Module()
+    weight = nn.Parameter(torch.empty(3))
+    weight.weight_loader = MagicMock()
+    model.layers[0].self_attn.fused_qkv.register_parameter("weight", weight)
+    values = [torch.tensor([float(i)]) for i in range(3)]
+    weights = [(f"layers.0.self_attn.{name}_proj.weight", value) for name, value in zip("qkv", values)]
+    with (
+        patch("vllm_ascend.models.kimi_k3.get_spec_layer_idx_from_weight_name", return_value=None),
+        patch("vllm_ascend.models.kimi_k3.fused_moe_make_expert_params_mapping", return_value=[]),
+        patch("vllm_ascend.models.kimi_k3.is_pp_missing_parameter", return_value=False),
+    ):
+        loaded = model.load_weights(weights)
+    assert loaded == {"layers.0.self_attn.fused_qkv.weight"}
+    assert weight.weight_loader.call_count == 3
+    for call, value, shard in zip(weight.weight_loader.call_args_list, values, "qkv"):
+        assert call.args[0] is weight
+        assert call.args[1] is value
+        assert call.args[2] == shard
