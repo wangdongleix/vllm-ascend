@@ -105,10 +105,13 @@ class TestCaMem(PytestBase):
         assert ptr not in allocator.pointer_to_data
         assert data.cpu_backup_tensor is None
 
+    @patch("vllm_ascend.device_allocator.camem.torch.npu.synchronize")
     @patch("vllm_ascend.device_allocator.camem.unmap_and_release")
     @patch("vllm_ascend.device_allocator.camem.memcpy")
-    def test_sleep_offload_and_discard(self, mock_memcpy, mock_unmap):
+    def test_sleep_offload_and_discard(self, mock_memcpy, mock_unmap, mock_synchronize):
         allocator = CaMemAllocator.get_instance()
+        mock_memcpy.side_effect = lambda *args: mock_synchronize.assert_called_once_with()
+        mock_unmap.side_effect = lambda *args: mock_synchronize.assert_called_once_with()
 
         # prepare allocation， one tag match，one not match
         handle1 = (1, 10, 1000, 0)

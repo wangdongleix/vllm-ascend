@@ -70,9 +70,11 @@ class TestTorchNPUProfilerWrapper(TestBase):
             torch_profiler_dir="/path/to/traces",
             torch_profiler_with_stack=True,
             torch_profiler_with_memory=True,
+            torch_profiler_record_shapes=True,
         )
 
         mock_export_type.Text = "Text"
+        mock_export_type.Db = "Db"
         mock_profiler_level.Level1 = "Level1"
         mock_aic_metrics.PipeUtilization = "PipeUtilization"
         mock_profiler_activity.CPU = "CPU"
@@ -91,12 +93,12 @@ class TestTorchNPUProfilerWrapper(TestBase):
         mock_experimental_config.assert_called_once()
         config_kwargs = mock_experimental_config.call_args.kwargs
         expected_config = {
-            "export_type": "Text",
+            "export_type": ["Db", "Text"],
             "profiler_level": "Level1",
             "msprof_tx": False,
             "aic_metrics": "PipeUtilization",
             "l2_cache": False,
-            "op_attr": False,
+            "op_attr": True,
             "data_simplification": True,
             "record_op_args": False,
             "gc_detect_threshold": None,
@@ -113,6 +115,8 @@ class TestTorchNPUProfilerWrapper(TestBase):
         profile_kwargs = mock_profile.call_args.kwargs
         self.assertEqual(profile_kwargs["activities"], ["CPU", "NPU"])
         self.assertTrue(profile_kwargs["profile_memory"])
+        self.assertTrue(profile_kwargs["with_stack"])
+        self.assertTrue(profile_kwargs["record_shapes"])
         self.assertEqual(profile_kwargs["with_modules"], True)
         self.assertEqual(profile_kwargs["on_trace_ready"], mock_trace_handler_instance)
         self.assertEqual(result, mock_profiler_instance)

@@ -201,6 +201,8 @@ class CaMemAllocator:
             len(self.pointer_to_data),
             offload_tags,
         )
+        # Finish pending kernels before unmapping their tensor memory.
+        torch.npu.synchronize()
         for ptr, data in self.pointer_to_data.items():
             if data.tag == CaMemAllocator.sleep_persistent_tag:
                 # This memory is not offloaded or released during sleep.
