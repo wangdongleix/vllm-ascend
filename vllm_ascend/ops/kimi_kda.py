@@ -10,18 +10,21 @@ replaced here with the Ascend metadata builder and AscendC operators.
 from functools import wraps
 
 import torch
+import torch.nn.functional as F
 import torch_npu
 from einops import rearrange
 from fla_npu.ops.ascendc import causal_conv1d_fn, causal_conv1d_update
 from torch import nn
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
+    RowParallelLinear,
 )
-from vllm.model_executor.utils import replace_parameter
 from vllm.models.kimi_k3.nvidia.kda import (
     KimiK3DeltaAttention,
+    _KimiGDNMergedColumnParallelLinear,
 )
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -47,6 +50,45 @@ from vllm_ascend.utils import npu_stream_switch
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
 _F_PROJ_SHARD_ID = 1
 _KDA_BFG_STREAM: torch.npu.Stream | None = None
+
+
+class _KimiTrainingInputProjection(_KimiGDNMergedColumnParallelLinear):
+    """Keep packed loading while evaluating the actor's separate projections."""
+
+    def __init__(self, *args, padding_size: int = 0, **kwargs) -> None:
+        self._padding_size = padding_size
+        super().__init__(*args, **kwargs)
+        # Padding has no checkpoint shard. Counting it as loadable leaves every
+        # layer's full TP input shards buffered until the final model flush.
+        self.weight.weight_loader_numel = self.weight.numel() - padding_size * self.weight.shape[1]
+        self._zero_padding(self.weight)
+
+    def _zero_padding(self, param: torch.Tensor) -> None:
+        if self._padding_size:
+            param.data[-self._padding_size :].zero_()
+
+    def weight_loader(self, param, loaded_weight, loaded_shard_id=None) -> None:
+        super().weight_loader(param, loaded_weight, loaded_shard_id)
+        self._zero_padding(param)
+
+    def weight_loader_v2(self, param, loaded_weight, loaded_shard_id=None) -> None:
+        super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
+        self._zero_padding(param)
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
+        sizes = [size // self.tp_size for size in self.output_sizes]
+        weights = self.weight.split(sizes, dim=0)
+        return torch.cat([F.linear(hidden_states, weight) for weight in weights], dim=-1), None
+
+
+class _KimiTrainingOutputProjection(RowParallelLinear):
+    """Reduce KDA output shards in FP32 before the BF16 output cast."""
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
+        output = F.linear(hidden_states.float(), self.weight.float())
+        if self.reduce_results and self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        return output.to(hidden_states.dtype), None
 
 
 def _kda_bfg_stream() -> torch.npu.Stream:
@@ -195,6 +237,38 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         super().__init__(config, vllm_config, prefix)
         self.uses_mixed_projection = uses_mixed_projection
         self._ascend_kda_state_copy = None
+        additional_config = vllm_config.additional_config or {}
+        self.training_backend = additional_config.get("kimi_training_backend", "megatron")
+        if self.training_backend not in ("fsdpturbo", "megatron"):
+            raise ValueError("kimi_training_backend must be fsdpturbo or megatron")
+        self.use_training_causal_conv1d = additional_config.get("kimi_training_causal_conv1d", False)
+        if additional_config.get("kimi_training_backend") is not None and quant_config is None:
+            output_sizes = [self.projection_size] * 4 + [self.head_dim, self.num_heads]
+            if self.in_proj_padding:
+                output_sizes.append(self.in_proj_padding * self.tp_size)
+            self.in_proj_qkvgfab = _KimiTrainingInputProjection(
+                self.hidden_size,
+                output_sizes,
+                replicated_shard_id=4,
+                tp_size=self.tp_size,
+                padding_size=self.in_proj_padding,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.in_proj_qkvgfab",
+            )
+            if self.in_proj_padding:
+                self.in_proj_qkvgfab.weight.data[-self.in_proj_padding :].zero_()
+        if additional_config.get("kimi_kda_oproj_fp32_reduce", False):
+            if quant_config is not None:
+                raise ValueError("KDA FP32 output reduction requires unquantized weights")
+            self.o_proj = _KimiTrainingOutputProjection(
+                self.projection_size,
+                self.hidden_size,
+                input_is_parallel=True,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.o_proj",
+            )
         if uses_mixed_projection:
             # vLLM 0.27 packs all KDA input projections into one linear.  A
             # QuaRot checkpoint instead stores q/k/v as W8A8 and keeps B/F/G
@@ -229,17 +303,15 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         # vLLM keeps the checkpoint-compatible FP32 [3C, 1, W] weight, while
         # fla_npu causal_conv1d consumes an activation-dtype [W, 3C]
         # tensor. Materialize that kernel layout once after weight loading.
-        self.register_parameter(
+        self.register_buffer(
             _PACKED_CONV_WEIGHT_NAME,
-            nn.Parameter(
-                torch.empty(
-                    self.conv_size,
-                    3 * self.local_projection_size,
-                    dtype=self.model_config.dtype,
-                    device=self.conv1d.weight.device,
-                ),
-                requires_grad=False,
+            torch.empty(
+                self.conv_size,
+                3 * self.local_projection_size,
+                dtype=self.model_config.dtype,
+                device=self.conv1d.weight.device,
             ),
+            persistent=False,
         )
         original_process_weights = self.conv1d.quant_method.process_weights_after_loading
 
@@ -379,8 +451,8 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             bias=None,
         )
 
-    @staticmethod
     def _run_causal_conv1d(
+        self,
         mixed_qkv: torch.Tensor,
         conv_weights_t: torch.Tensor,
         conv_state: torch.Tensor,
@@ -393,6 +465,18 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         cache_indices = _normalize_causal_cache_indices(cache_indices)
+        if self.use_training_causal_conv1d:
+            if num_accepted_tokens is not None:
+                raise ValueError("Training-identical Kimi convolution does not support speculative decode")
+            return self._run_training_causal_conv1d(
+                mixed_qkv,
+                conv_weights_t,
+                conv_state,
+                query_start_loc,
+                cache_indices,
+                initial_state_mode,
+                run_mode=run_mode,
+            )
         if run_mode == 0:
             return causal_conv1d_fn(
                 mixed_qkv,
@@ -424,23 +508,75 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             out=output,
         )
 
+    def _run_training_causal_conv1d(
+        self,
+        mixed_qkv: torch.Tensor,
+        weights: torch.Tensor,
+        conv_state: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        cache_indices: torch.Tensor,
+        initial_state_mode: torch.Tensor | None,
+        *,
+        run_mode: int,
+    ) -> torch.Tensor:
+        """Use the actor convolution and translate only the cache interface."""
+        if self.training_backend == "fsdpturbo":
+            from fsdp_turbo.ops.causal_conv1d import causal_conv1d
+        else:
+            from mindspeed_ops.api.triton.convolution import causal_conv1d
+
+        num_sequences = query_start_loc.numel() - 1
+        history = conv_state.shape[1]
+        if cache_indices.numel() != num_sequences or history != weights.shape[0] - 1:
+            raise ValueError("Training-identical Kimi convolution cache metadata mismatch")
+        valid = (cache_indices != PAD_SLOT_ID) & (cache_indices != 0)
+        safe_indices = torch.where(valid, cache_indices, cache_indices[:1].clamp_min(0))
+        active_state = conv_state[safe_indices].transpose(1, 2).contiguous()
+        if initial_state_mode is not None:
+            initial_state_mode = initial_state_mode.reshape(-1).bool()
+            active_state = torch.where(
+                (initial_state_mode & valid)[:, None, None], active_state, torch.zeros_like(active_state)
+            )
+            use_initial_state = run_mode != 0 or bool(initial_state_mode.any().item())
+        else:
+            use_initial_state = True
+        actor_state = F.pad(active_state, (1, 0))
+        single_token_decode = run_mode != 0 and mixed_qkv.shape[0] == num_sequences
+        cu_seqlens = None if single_token_decode else query_start_loc.to(mixed_qkv.device, dtype=torch.int32)
+        outputs, states = [], []
+        width = mixed_qkv.shape[-1] // 3
+        for part in range(3):
+            begin, end = part * width, (part + 1) * width
+            output, state = causal_conv1d(
+                x=mixed_qkv[:, begin:end].unsqueeze(1 if single_token_decode else 0),
+                weight=weights[:, begin:end].contiguous(),
+                initial_state=actor_state[:, begin:end].contiguous() if use_initial_state else None,
+                activation="silu",
+                cu_seqlens=cu_seqlens,
+                output_final_state=True,
+            )
+            outputs.append(output)
+            states.append(state)
+        updated = torch.cat(states, dim=1)[..., -history:].transpose(1, 2).contiguous().to(conv_state.dtype)
+        # Graph-padding rows alias the first real request and write its same value.
+        updated = torch.where(valid[:, None, None], updated, updated[:1].expand_as(updated))
+        conv_state.index_copy_(0, safe_indices, updated)
+        return torch.cat(outputs, dim=-1).squeeze(1 if single_token_decode else 0)
+
     @torch.no_grad()
     def _pack_conv_weights(self) -> None:
         if self.conv1d.weight.is_meta:
             return
-        packed_param = self.get_parameter(_PACKED_CONV_WEIGHT_NAME)
+        packed_param = self.get_buffer(_PACKED_CONV_WEIGHT_NAME)
         packed_weight = (
             self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
             .transpose(0, 1)
             .to(device=packed_param.device, dtype=packed_param.dtype)
             .contiguous()
         )
-        replace_parameter(
-            self,
-            _PACKED_CONV_WEIGHT_NAME,
-            packed_weight,
-            prefer_copy=True,
-        )
+        # This is derived kernel state, not an additional checkpoint weight.
+        # Preserve the buffer captured by decode graphs across every reload.
+        packed_param.copy_(packed_weight)
 
     def _run_recurrent(
         self,
@@ -560,7 +696,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         )
 
         conv_state, recurrent_state = self.kv_cache
-        conv_weights_t = self.get_parameter(_PACKED_CONV_WEIGHT_NAME)
+        conv_weights_t = self.get_buffer(_PACKED_CONV_WEIGHT_NAME)
         spec_masks = attn_metadata.spec_sequence_masks
         spec_token_indices = attn_metadata.spec_token_indx
         non_spec_token_indices = attn_metadata.non_spec_token_indx

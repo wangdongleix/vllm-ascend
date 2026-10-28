@@ -11,9 +11,11 @@ import math
 from bisect import bisect_left
 from collections.abc import Callable, Iterable, Sequence
 from copy import copy
+from itertools import chain
 from typing import Any, TypeVar, cast
 
 import torch
+import torch.nn.functional as F
 import vllm.envs as envs
 from torch import nn
 from vllm.config import CacheConfig, VllmConfig
@@ -88,6 +90,7 @@ from vllm.utils.math_utils import cdiv
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.ops.fused_moe.router.kimi_training_router import KimiTrainingRouter
 from vllm_ascend.ops.kimi_kda import AscendKimiK3DeltaAttention  # type: ignore[import-untyped]
 from vllm_ascend.ops.linear_op import KimiOProjMMReduceScatterOp
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
@@ -190,6 +193,43 @@ class AscendKimiMLP(KimiMLP):
 
 
 _WeightT = TypeVar("_WeightT", bound=tuple[str, torch.Tensor] | tuple[str, torch.Tensor, dict[str, Any]])
+_VERL_PACKED_LOCAL_MARKER = ".__verl_packed_local__."
+
+
+def _load_packed_expert_weight(
+    name: str, weight: torch.Tensor, get_parameter: Callable[[str], nn.Parameter], num_experts: int
+) -> str:
+    """Load trainer input-major experts through the authoritative EP loader."""
+    expert_start = None
+    if _VERL_PACKED_LOCAL_MARKER in name:
+        name, start = name.rsplit(_VERL_PACKED_LOCAL_MARKER, 1)
+        expert_start = int(start)
+    first_expert = expert_start if expert_start is not None else 0
+    if weight.ndim != 3 or first_expert < 0 or first_expert + weight.shape[0] > num_experts:
+        raise ValueError(f"Invalid Kimi packed expert range or shape: {name}, {tuple(weight.shape)}")
+    gate_up = name.endswith(".gate_up_proj")
+    target = name.rsplit(".experts.", 1)[0] + ".experts.routed_experts."
+    target += "w13_weight" if gate_up else "w2_weight"
+    param = get_parameter(target)
+    if gate_up and weight.shape[-1] % 2:
+        raise ValueError(f"Packed Kimi gate/up width must be even: {name}")
+    half = weight.shape[-1] // 2
+    for index, expert_weight in enumerate(weight):
+        shards = (
+            (("w1", expert_weight[:, :half]), ("w3", expert_weight[:, half:])) if gate_up else (("w2", expert_weight),)
+        )
+        for shard_id, shard in shards:
+            loaded = param.weight_loader(
+                param,
+                shard.t().contiguous(),
+                f"{name}.weight",
+                expert_id=first_expert + index,
+                shard_id=shard_id,
+                return_success=expert_start is not None,
+            )
+            if expert_start is not None and not loaded:
+                raise RuntimeError(f"vLLM rejected trainer packed-local expert {first_expert + index}: {name}")
+    return target
 
 
 def load_eplb_expert_weights(
@@ -366,6 +406,12 @@ class AscendKimiMoE(nn.Module):
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=num_redundant_experts,
         )
+        if vllm_config.aux_output_config.enable_return_routed_experts or (vllm_config.additional_config or {}).get(
+            "kimi_training_backend"
+        ):
+            router = KimiTrainingRouter(self.experts.router)
+            self.experts.router = router
+            self.experts.routed_experts.router = router
 
         # Use the factory's validated counts, including its effective EP size.
         moe_config = self.experts.moe_config
@@ -479,6 +525,10 @@ class AscendKimiMLAAttention(UpstreamKimiMLAAttention):
     @property
     def kv_cache(self):
         return self._attention_layer.kv_cache
+
+    @kv_cache.setter
+    def kv_cache(self, value):
+        self._attention_layer.kv_cache = value
 
     @property
     def kv_cache_dtype(self):
@@ -881,8 +931,8 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
         self,
         weights: Iterable[tuple[str, torch.Tensor] | tuple[str, torch.Tensor, dict[str, Any]]],
     ) -> set[str]:
-        """Reuse upstream loading with Ascend KDA gates and EPLB replicas."""
-        params_dict = dict(self.named_parameters())
+        """Reuse upstream loading with packed trainer experts and Ascend gates."""
+        packed_loaded_params: set[str] = set()
         gate_mapping = (
             (".b_proj.weight", ".fused_bfg_proj.weight", 0),
             (".f_a_proj.weight", ".fused_bfg_proj.f_a_weight", None),
@@ -893,11 +943,21 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
         def remap_mixed_gate_weights():
             for args in weights:
                 name, loaded_weight = args[:2]
+                physical_name = name.split(_VERL_PACKED_LOCAL_MARKER, 1)[0]
+                if physical_name.endswith((".experts.gate_up_proj", ".experts.down_proj")):
+                    packed_loaded_params.add(
+                        _load_packed_expert_weight(name, loaded_weight, self.get_parameter, self.config.num_experts)
+                    )
+                    continue
                 for source, target, shard_id in gate_mapping:
                     if source not in name:
                         continue
                     mapped_name = name.replace(source, target)
-                    if mapped_name in params_dict:
+                    try:
+                        self.get_parameter(mapped_name)
+                    except AttributeError:
+                        continue
+                    else:
                         kwargs = dict(args[2]) if len(args) > 2 else {}
                         kwargs["loaded_shard_id"] = shard_id
                         yield mapped_name, loaded_weight, kwargs
@@ -905,9 +965,17 @@ class AscendKimiLinearModel(UpstreamKimiLinearModel):
                 else:
                     yield args
 
-        return super().load_weights(
-            load_eplb_expert_weights(self, remap_mixed_gate_weights(), self.n_redundant_experts)
+        # Packed trainer buckets can be consumed entirely above. Peek before
+        # invoking the upstream loader, which otherwise traverses every layer
+        # to build expert mappings and parameter dictionaries for an empty stream.
+        remaining = iter(remap_mixed_gate_weights())
+        first = next(remaining, None)
+        if first is None:
+            return packed_loaded_params
+        loaded_params = super().load_weights(
+            load_eplb_expert_weights(self, chain((first,), remaining), self.n_redundant_experts)
         )
+        return loaded_params | packed_loaded_params
 
     def forward(
         self,
@@ -1180,6 +1248,24 @@ class AscendKimiK3MultiModalProjector(KimiK25MultiModalProjector):
         return hidden_states
 
 
+class KimiTrainingPatchEmbed(nn.Module):
+    """Retain vision checkpoint names with the actor's FP32 patch projection."""
+
+    def __init__(self, patch_embed: nn.Module) -> None:
+        super().__init__()
+        self.proj = patch_embed.proj
+        self.input_norm = patch_embed.input_norm
+        self.pos_emb = patch_embed.pos_emb
+
+    def forward(self, x, grid_thws, *, pos_embeds=None):
+        x = self.input_norm(x.flatten(1), self.proj.weight.dtype)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            bias = self.proj.bias.float() if self.proj.bias is not None else None
+            output = F.linear(x.float(), self.proj.weight.flatten(1).float(), bias)
+        output = output.to(self.proj.weight.dtype)
+        return output + pos_embeds if pos_embeds is not None else self.pos_emb(output, grid_thws)
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     KimiK3MultiModalProcessor,
     info=KimiK3ProcessingInfo,
@@ -1187,6 +1273,11 @@ class AscendKimiK3MultiModalProjector(KimiK25MultiModalProjector):
 )
 class AscendKimiK3ForConditionalGeneration(UpstreamKimiK3ForConditionalGeneration):
     """Upstream Kimi K3 multimodal wrapper with Ascend text/projector layers."""
+
+    # This constructor uses checkpoint-normalized pixels and IdentityInputNorm.
+    # Do not inherit the upstream device-normalization capability: its separate
+    # constructor installs build_mm_input_norm, while this path does not.
+    supports_mm_device_do_normalize = False
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
@@ -1202,13 +1293,19 @@ class AscendKimiK3ForConditionalGeneration(UpstreamKimiK3ForConditionalGeneratio
         self.hidden_size = self.config.text_config.hidden_size
         self.device = current_platform.current_device()
         vision_quant_config = self._maybe_ignore_quant_config(self.quant_config)
+        training_backend = (vllm_config.additional_config or {}).get("kimi_training_backend")
+        vision_config = copy(self.config.vision_config)
+        if training_backend is not None:
+            vision_config.pos_emb_interpolation_mode = "bicubic"
 
         with self._mark_tower_model(vllm_config, "image"):
             self.vision_tower = MoonViT3dPretrainedModel(
-                self.config.vision_config,
+                vision_config,
                 quant_config=vision_quant_config,
                 prefix=maybe_prefix(prefix, "vision_tower"),
             )
+            if training_backend is not None and vision_quant_config is None:
+                self.vision_tower.patch_embed = KimiTrainingPatchEmbed(self.vision_tower.patch_embed)
             if vision_quant_config is not None:
                 self.vision_tower = self.vision_tower.to(device=self.device)
             else:
@@ -1222,7 +1319,10 @@ class AscendKimiK3ForConditionalGeneration(UpstreamKimiK3ForConditionalGeneratio
                 use_data_parallel=self.use_data_parallel,
                 quant_config=vision_quant_config,
                 prefix=maybe_prefix(prefix, "mm_projector"),
-                enable_rotation=get_rotation_path(vllm_config) is not None,
+                enable_rotation=(
+                    getattr(self.config.vision_config, "use_rot_proj", False)
+                    or get_rotation_path(vllm_config) is not None
+                ),
                 # vLLM main made `out_hidden_size` a required argument; v0.31.0
                 # resolves the output size internally from the vision config.
                 **({} if vllm_version_is("0.31.0") else {"out_hidden_size": self.hidden_size}),

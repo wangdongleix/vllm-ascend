@@ -563,6 +563,11 @@ class AscendConfig:
     model_config = ConfigDict(extra="forbid")
 
     # ---- user-input switches: bool/int/list/str, auto type validation ----
+    # Kimi rollout alignment with the selected training engine. None preserves
+    # the ordinary inference path; the two numeric options are opt-in.
+    kimi_training_backend: Literal["fsdpturbo", "megatron"] | None = None
+    kimi_training_causal_conv1d: bool = False
+    kimi_kda_oproj_fp32_reduce: bool = False
     enable_cpu_binding: bool = True
     multistream_dsv4_dsa_overlap: bool = True
     # Prepare Engram hashes, lookups and DP/TP exchanges on an auxiliary stream;

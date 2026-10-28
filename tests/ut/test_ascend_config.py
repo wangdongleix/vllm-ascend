@@ -407,6 +407,31 @@ class TestAscendConfig(TestBase):
         self.assertIn("flashkda", warned_text)
 
     @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_kimi_training_config_survives_factory_validation(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "kimi_training_backend": "fsdpturbo",
+            "kimi_training_causal_conv1d": True,
+            "kimi_kda_oproj_fp32_reduce": True,
+            "rl_config": {"sleep_mode_extra_cleanup": False},
+        }
+        ascend_config = init_ascend_config(test_vllm_config)
+        self.assertEqual(ascend_config.kimi_training_backend, "fsdpturbo")
+        self.assertTrue(ascend_config.kimi_training_causal_conv1d)
+        self.assertTrue(ascend_config.kimi_kda_oproj_fp32_reduce)
+        self.assertFalse(ascend_config.rl_config.sleep_mode_extra_cleanup)
+        self.assertEqual(test_vllm_config.additional_config["kimi_training_backend"], "fsdpturbo")
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_kimi_training_config_rejects_invalid_backend(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {"kimi_training_backend": "unknown"}
+        with self.assertRaises(ValueError):
+            init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
     @patch("vllm_ascend.ascend_config.logger")
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_init_ascend_config_silent_triton_prefill_backend(self, mock_fix_incompatible_config, mock_logger):
