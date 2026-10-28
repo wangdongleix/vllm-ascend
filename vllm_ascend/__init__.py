@@ -63,8 +63,10 @@ def _ensure_global_patch():
     if _GLOBAL_PATCH_APPLIED:
         return
 
+    from vllm_ascend.patch.kimi_full_r3_schema import install_kimi_full_r3_schema_patch
     from vllm_ascend.utils import adapt_patch
 
+    install_kimi_full_r3_schema_patch()
     adapt_patch(is_global_patch=True)
     _GLOBAL_PATCH_APPLIED = True
 

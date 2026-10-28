@@ -28,6 +28,25 @@
 
 # What's Patched and how it works:
 # --------------------------------
+# ** File: kimi_full_r3_schema.py **
+#   Target: routed_experts_capturer._get_routed_experts_shape
+#   Why: Kimi training replays executed expert IDs and exact BF16 weights.
+#   How: Reserve three integer lanes per top-k entry before worker and engine
+#        buffers are allocated. Other models retain their upstream wire shape.
+#   Related PR: No upstream full-weight replay interface is available.
+#   Future Plan: Remove when upstream supports model-specific routing payloads.
+#
+# ** File: worker/patch_layerwise_reload.py **
+#   Target: reload.layerwise callable-loader wrappers and reload.meta skip sets
+#   Why: Callable loaders may be functools.partial without __name__. Ascend
+#        runtime routing buffers and derived weights are not checkpoint inputs.
+#   How: Unwrap callable loaders safely and use upstream reload skip sets.
+#        Reuse upstream deferred loading, metadata restoration and graph storage;
+#        the caller (verl's bucket receiver) owns source tensors before loading.
+#   Related PR: No upstream fix covers both callable loaders and Ascend buffers.
+#   Future Plan: Remove when upstream handles arbitrary callable loaders and
+#        provides runtime-buffer exclusions for Ascend routing and derived weights.
+#
 # * Platform Patch:
 # ==========#
 # Entries are listed in alphabetical order by file name.
