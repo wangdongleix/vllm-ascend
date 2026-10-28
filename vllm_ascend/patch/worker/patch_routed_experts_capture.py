@@ -28,6 +28,12 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.patch.kimi_full_r3_schema import (
+    KIMI_FULL_R3_PACK_FACTOR,
+    install_kimi_full_r3_schema_patch,
+)
+
+install_kimi_full_r3_schema_patch()
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +104,15 @@ def _gather_tp_sharded_topk_ids(topk_ids: torch.Tensor, tp_size: int, total_rows
     return gathered
 
 
-def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+def _pack_kimi_full_r3(topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> torch.Tensor:
+    """Keep full expert IDs and exact BF16 weight bits in integer lanes."""
+    if topk_ids.shape != topk_weights.shape or topk_weights.dtype != torch.bfloat16:
+        raise ValueError("Kimi full R3 requires matching IDs and executed BF16 weights")
+    weight_bytes = topk_weights.contiguous().view(torch.uint8).reshape(*topk_weights.shape, 2)
+    return torch.cat((topk_ids, weight_bytes[..., 0].int(), weight_bytes[..., 1].int()), dim=-1)
+
+
+def capture(self, layer_id: int, topk_ids: torch.Tensor, topk_weights: torch.Tensor | None = None) -> None:
     """Capture expert routing decisions for a specific layer.
 
     Under data parallelism, ``topk_ids`` may have four different batch
@@ -136,6 +150,17 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
         topk_ids: Tensor of shape (batch_size, num_routed_experts).
     """
 
+    if not 0 <= layer_id < self.device_buffer.shape[1]:
+        raise IndexError(f"Routed-experts layer {layer_id} exceeds the capture buffer")
+    topk = topk_ids.shape[-1]
+    width = self.device_buffer.shape[-1]
+    if width == topk * KIMI_FULL_R3_PACK_FACTOR:
+        if topk_weights is None:
+            raise RuntimeError("Kimi full R3 requires the executed router weights")
+        topk_ids = _pack_kimi_full_r3(topk_ids, topk_weights)
+    elif width != topk:
+        raise ValueError(f"Routed-experts capture width {width} does not match top-k {topk}")
+
     ctx = get_forward_context()
     if ctx.dp_metadata is None:  # single dp
         start_loc = 0
@@ -169,7 +194,21 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
         max_tokens = int(num_tokens_dp.max().item())
         total_with_padding = max_tokens * len(num_tokens_dp)
 
-        if n == total:
+        if (
+            self.tp_size > 1
+            and _EXTRA_CTX.moe_comm_type in _TP_SHARDED_COMM_TYPES
+            and getattr(getattr(_EXTRA_CTX.moe_comm_method, "prepare_finalize", None), "replace_allreduce", False)
+            is True
+        ):
+            # FlashComm sequence parallelism already padded the model input to
+            # a TP multiple, including when DP metadata contains just one rank.
+            # Re-splitting the unpadded DP count gives smaller receive tensors
+            # on trailing ranks and makes HCCL AllGatherV reject the collective.
+            total_rows = _padded_batch_rows(self.tp_size)
+            topk_ids = _gather_tp_sharded_topk_ids(topk_ids, self.tp_size, total_rows)
+            start_loc = 0
+            end_loc = token_num_per_dp
+        elif n == total:
             # Naive dispatch: all DP ranks' tokens concatenated
             # before routing. This rank owns tokens
             # [end_loc - token_num_per_dp, end_loc).
@@ -259,11 +298,6 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
                 f"{total_with_padding}, or {sp_expected} for "
                 f"dp_rank={self.dp_rank}, tp_size={self.tp_size})"
             )
-
-    # Defensive: model may expose more layers than the capture buffer
-    # was sized for (unusual, but guards against miss-config).
-    if layer_id >= self.device_buffer.shape[1]:
-        return
 
     self.device_buffer[:token_num_per_dp, layer_id, :] = topk_ids[start_loc:end_loc, :]
 
