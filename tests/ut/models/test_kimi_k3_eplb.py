@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from torch import nn
+from vllm.config import AuxOutputConfig
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.models import utils as model_utils
 from vllm.model_executor.models.interfaces import is_mixture_of_experts
@@ -15,6 +16,7 @@ from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_ascend.models import kimi_k3 as k3_module
 from vllm_ascend.models import kimi_k3_mtp as mtp_module
+from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTopKRouter
 from vllm_ascend.patch.platform import patch_eplb
 
 
@@ -406,7 +408,8 @@ def test_eplb_expert_remapping_preserves_weight_metadata():
 
 
 @pytest.mark.parametrize("enable_eplb", [False, True])
-def test_moe_uses_factory_expert_counts(monkeypatch, enable_eplb):
+@pytest.mark.parametrize("capture_routing", [False, True])
+def test_moe_uses_factory_expert_counts(monkeypatch, enable_eplb, capture_routing):
     config = SimpleNamespace(
         hidden_size=4,
         moe_intermediate_size=8,
@@ -430,15 +433,39 @@ def test_moe_uses_factory_expert_counts(monkeypatch, enable_eplb):
         num_experts=264 if enable_eplb else 256,
         num_local_experts=33 if enable_eplb else 256,
     )
+    runner.router = AscendGroupedTopKRouter(
+        top_k=2,
+        global_num_experts=256,
+        num_expert_group=1,
+        topk_group=1,
+        use_grouped_topk=False,
+        scoring_func="sigmoid",
+    )
+    runner.routed_experts = nn.Module()
+    runner.routed_experts.router = runner.router
+    original_router = runner.router
     factory = MagicMock(return_value=runner)
     monkeypatch.setattr(k3_module, "FusedMoEFactory", factory)
     monkeypatch.setattr(
         k3_module, "GateLinear", lambda input_size, output_size, **kwargs: nn.Linear(input_size, output_size)
     )
 
-    moe = k3_module.AscendKimiMoE(config=config, vllm_config=SimpleNamespace(parallel_config=parallel))
+    moe = k3_module.AscendKimiMoE(
+        config=config,
+        vllm_config=SimpleNamespace(
+            parallel_config=parallel,
+            aux_output_config=AuxOutputConfig(enable_return_routed_experts=capture_routing),
+            additional_config={},
+        ),
+    )
 
     assert factory.call_args.kwargs["enable_eplb"] == enable_eplb
     assert factory.call_args.kwargs["num_redundant_experts"] == (8 if enable_eplb else 0)
     assert moe.n_physical_experts == runner.moe_config.num_experts
     assert moe.n_local_physical_experts == runner.moe_config.num_local_experts
+    assert isinstance(runner.router, k3_module.KimiTrainingRouter) == capture_routing
+    assert runner.routed_experts.router is runner.router
+    if capture_routing:
+        assert runner.router.router is original_router
+    else:
+        assert runner.router is original_router
