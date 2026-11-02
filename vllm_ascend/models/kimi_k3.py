@@ -480,7 +480,7 @@ class AscendKimiMoE(nn.Module):
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=num_redundant_experts,
         )
-        if vllm_config.aux_output_config.enable_return_routed_experts or (vllm_config.additional_config or {}).get(
+        if vllm_config.model_config.enable_return_routed_experts or (vllm_config.additional_config or {}).get(
             "kimi_training_backend"
         ):
             router = KimiTrainingRouter(self.experts.router)

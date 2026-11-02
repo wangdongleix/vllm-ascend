@@ -8,7 +8,6 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from torch import nn
-from vllm.config import AuxOutputConfig
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.models import utils as model_utils
 from vllm.model_executor.models.interfaces import is_mixture_of_experts
@@ -454,7 +453,7 @@ def test_moe_uses_factory_expert_counts(monkeypatch, enable_eplb, capture_routin
         config=config,
         vllm_config=SimpleNamespace(
             parallel_config=parallel,
-            aux_output_config=AuxOutputConfig(enable_return_routed_experts=capture_routing),
+            model_config=SimpleNamespace(enable_return_routed_experts=capture_routing),
             additional_config={},
         ),
     )

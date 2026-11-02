@@ -40,6 +40,15 @@ reload_meta.SKIP_LOAD_TENSORS.update(_ASCEND_NON_CHECKPOINT_TENSORS)
 reload_meta.SKIP_TENSORS.update(_ASCEND_NON_CHECKPOINT_TENSORS)
 
 
+def _get_layer_size(layer: torch.nn.Module) -> int:
+    """Exclude projection padding from vLLM 0.30 reload completion counts."""
+    return sum(
+        getattr(tensor, "weight_loader_numel", tensor.numel())
+        for name, tensor in layerwise_reload.get_layer_tensors(layer).items()
+        if name not in reload_meta.SKIP_LOAD_TENSORS
+    )
+
+
 def _wrap_parameters_weight_loader(layer: torch.nn.Module) -> None:
     """Wrap partial and other callable loaders without assuming __name__."""
     for name, tensor in layerwise_reload.get_layer_tensors(layer).items():
@@ -60,3 +69,4 @@ def _get_original_loader(tensor: torch.Tensor) -> Callable:
 
 layerwise_reload._wrap_parameters_weight_loader = _wrap_parameters_weight_loader
 layerwise_reload._get_original_loader = _get_original_loader
+layerwise_reload.get_layer_size = _get_layer_size

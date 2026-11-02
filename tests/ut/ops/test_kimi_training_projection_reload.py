@@ -59,7 +59,8 @@ def test_padded_tp_projection_finishes_each_reload_without_model_flush():
             local_rows = rows if shard_id == 4 else rows // tp_size
             offset = 0 if shard_id == 4 else tp_rank * local_rows
             expected.append(source[offset : offset + local_rows].clone())
-            layer.weight.weight_loader(layer.weight, source, shard_id)
+            # Verl owns the IPC view before passing it to deferred loaders.
+            layer.weight.weight_loader(layer.weight, source.clone(), shard_id)
             source.fill_(-999)  # The IPC bucket may be reused immediately.
         info = layerwise.get_layerwise_info(layer)
         assert not info.loaded_weights
