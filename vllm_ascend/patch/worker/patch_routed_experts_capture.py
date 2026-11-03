@@ -28,12 +28,6 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
-from vllm_ascend.patch.kimi_full_r3_schema import (
-    KIMI_FULL_R3_PACK_FACTOR,
-    install_kimi_full_r3_schema_patch,
-)
-
-install_kimi_full_r3_schema_patch()
 
 logger = logging.getLogger(__name__)
 
@@ -104,15 +98,7 @@ def _gather_tp_sharded_topk_ids(topk_ids: torch.Tensor, tp_size: int, total_rows
     return gathered
 
 
-def _pack_kimi_full_r3(topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> torch.Tensor:
-    """Keep full expert IDs and exact BF16 weight bits in integer lanes."""
-    if topk_ids.shape != topk_weights.shape or topk_weights.dtype != torch.bfloat16:
-        raise ValueError("Kimi full R3 requires matching IDs and executed BF16 weights")
-    weight_bytes = topk_weights.contiguous().view(torch.uint8).reshape(*topk_weights.shape, 2)
-    return torch.cat((topk_ids, weight_bytes[..., 0].int(), weight_bytes[..., 1].int()), dim=-1)
-
-
-def capture(self, layer_id: int, topk_ids: torch.Tensor, topk_weights: torch.Tensor | None = None) -> None:
+def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
     """Capture expert routing decisions for a specific layer.
 
     Under data parallelism, ``topk_ids`` may have four different batch
@@ -154,11 +140,7 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor, topk_weights: torch.Ten
         raise IndexError(f"Routed-experts layer {layer_id} exceeds the capture buffer")
     topk = topk_ids.shape[-1]
     width = self.device_buffer.shape[-1]
-    if width == topk * KIMI_FULL_R3_PACK_FACTOR:
-        if topk_weights is None:
-            raise RuntimeError("Kimi full R3 requires the executed router weights")
-        topk_ids = _pack_kimi_full_r3(topk_ids, topk_weights)
-    elif width != topk:
+    if width != topk:
         raise ValueError(f"Routed-experts capture width {width} does not match top-k {topk}")
 
     ctx = get_forward_context()

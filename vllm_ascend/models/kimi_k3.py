@@ -90,7 +90,6 @@ from vllm.utils.math_utils import cdiv
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
-from vllm_ascend.ops.fused_moe.router.kimi_training_router import KimiTrainingRouter
 from vllm_ascend.ops.kimi_kda import (
     AscendKimiK3DeltaAttention as AscendKimiK3DeltaAttentionBase,
 )
@@ -480,13 +479,6 @@ class AscendKimiMoE(nn.Module):
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=num_redundant_experts,
         )
-        if vllm_config.model_config.enable_return_routed_experts or (vllm_config.additional_config or {}).get(
-            "kimi_training_backend"
-        ):
-            router = KimiTrainingRouter(self.experts.router)
-            self.experts.router = router
-            self.experts.routed_experts.router = router
-
         # Use the factory's validated counts, including its effective EP size.
         moe_config = self.experts.moe_config
         self.n_routed_experts = num_experts

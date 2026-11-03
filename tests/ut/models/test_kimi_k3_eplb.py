@@ -462,9 +462,5 @@ def test_moe_uses_factory_expert_counts(monkeypatch, enable_eplb, capture_routin
     assert factory.call_args.kwargs["num_redundant_experts"] == (8 if enable_eplb else 0)
     assert moe.n_physical_experts == runner.moe_config.num_experts
     assert moe.n_local_physical_experts == runner.moe_config.num_local_experts
-    assert isinstance(runner.router, k3_module.KimiTrainingRouter) == capture_routing
+    assert runner.router is original_router
     assert runner.routed_experts.router is runner.router
-    if capture_routing:
-        assert runner.router.router is original_router
-    else:
-        assert runner.router is original_router

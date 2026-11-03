@@ -40,6 +40,12 @@ You can check the [support status of vLLM V1 Engine][v1_user_guide]. Below is th
 - 🟡 Planned: Scheduled for future implementation (some may have open PRs/RFCs).
 - 🔴 NO plan/Deprecated: No plan or deprecated by vLLM.
 
+With `enable_return_routed_experts=True`, routing replay uses the upstream
+`routed_experts` tensor of logical expert IDs, shaped as
+`[token_rows, layers, top_k]`, including for Kimi K3. The training actor computes
+its router weights from its own logits. TP/DP capture preserves the complete
+token order before expert load-balancing maps logical IDs to physical slots.
+
 [v1_user_guide]: https://docs.vllm.ai/en/latest/usage/v1_guide/
 [multimodal]: https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/Qwen-VL-Dense.html
 [guided_decoding]: https://github.com/vllm-project/vllm-ascend/issues/177
