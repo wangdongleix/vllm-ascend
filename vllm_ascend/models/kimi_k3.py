@@ -1335,6 +1335,31 @@ class KimiTrainingPatchEmbed(nn.Module):
 
 
 class AscendKimiK3MultiModalProcessor(KimiK3MultiModalProcessor):
+    def _preprocess_hf_mm_data(self, mm_data, hf_processor_mm_kwargs):
+        # v0.30's Kimi HF processor does not forward image resize kwargs.
+        # Reject them rather than silently producing a different feature grid.
+        resize_keys = {
+            "size",
+            "do_resize",
+            "crop_size",
+            "do_center_crop",
+            "min_pixels",
+            "max_pixels",
+            "min_patches",
+            "max_patches",
+            "patch_size",
+            "merge_kernel_size",
+            "in_patch_limit",
+            "patch_limit_on_one_side",
+            "fixed_output_tokens",
+        }
+        unsupported = resize_keys.intersection(hf_processor_mm_kwargs)
+        if hf_processor_mm_kwargs.get("images_kwargs"):
+            unsupported.add("images_kwargs")
+        if unsupported:
+            raise TypeError(f"Kimi vLLM 0.30 does not support image preprocessing overrides: {sorted(unsupported)}")
+        return mm_data, hf_processor_mm_kwargs
+
     def _get_prompt_updates(self, mm_items, hf_processor_mm_kwargs, out_mm_kwargs):
         (update,) = super()._get_prompt_updates(mm_items, hf_processor_mm_kwargs, out_mm_kwargs)
 
@@ -1343,8 +1368,17 @@ class AscendKimiK3MultiModalProcessor(KimiK3MultiModalProcessor):
             prompt = self.info.image_processor.make_image_prompt(*images.get_image_size(item_idx))
             return cached_encode(self.info.get_tokenizer(), prompt, add_special_tokens=False)
 
-        # Accept checkpoint-processed media text through the same native update.
-        return [update, PromptReplacement(modality="image", target=hf_target, replacement=update.content)]
+        # Expanded HF prompts keep their token coordinates while native vLLM
+        # still records the embedding slots through the same update content.
+        return [
+            update,
+            PromptReplacement(modality="image", target=hf_target, replacement=update.content),
+            PromptReplacement(
+                modality="image",
+                target=lambda item_idx: update.resolve(item_idx).content.full,
+                replacement=update.content,
+            ),
+        ]
 
 
 @MULTIMODAL_REGISTRY.register_processor(

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import math
 import os
 from abc import ABC, abstractmethod
 from collections import deque
@@ -60,6 +61,7 @@ def native():
         root = Path(spec.origin).parent
     namespace = dict(
         torch=torch,
+        math=math,
         ABC=ABC,
         abstractmethod=abstractmethod,
         deque=deque,
@@ -95,6 +97,8 @@ def native():
             "_plan_prompt_updates",
             "_apply_matches",
             "apply_token_matches",
+            "PlaceholderFeaturesInfo",
+            "_apply_token_matches_with_placeholders",
         },
         namespace,
     )
@@ -105,7 +109,9 @@ def native():
             return cls
 
     namespace.update(BaseMultiModalProcessor=Base, KimiK3ProcessingInfo=object, ImageProcessorItems=object)
-    _definitions(root / "models/kimi_k3/common/mm_preprocess.py", {"KimiK3MultiModalProcessor"}, namespace)
+    _definitions(
+        root / "models/kimi_k3/common/mm_preprocess.py", {"KimiK3MultiModalProcessor", "navit_resize_image"}, namespace
+    )
     _definitions(
         Path(__file__).resolve().parents[3] / "vllm_ascend/models/kimi_k3.py",
         {
@@ -117,7 +123,7 @@ def native():
 
 
 def _tokenizer():
-    backend = Tokenizer(models.WordLevel({"<unk>": 0, "image": 1, "28x14": 2, "14x14": 3}, unk_token="<unk>"))
+    backend = Tokenizer(models.WordLevel({"<unk>": 0, "image": 1, "56x28": 2, "28x28": 3}, unk_token="<unk>"))
     backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
     return PreTrainedTokenizerFast(
         tokenizer_object=backend,
@@ -133,14 +139,20 @@ def _tokenizer():
     )
 
 
-@pytest.mark.parametrize("count,prompt_format", [(0, "native"), (1, "native"), (1, "hf"), (2, "native"), (2, "hf")])
+@pytest.mark.parametrize(
+    "count,prompt_format",
+    [(0, "native"), (1, "native"), (1, "hf"), (2, "native"), (2, "hf"), (1, "expanded"), (2, "expanded")],
+)
 def test_native_prompt_updates_accept_raw_or_checkpoint_media_blocks(native, prompt_format, count):
     _, namespace = native
     tokenizer = _tokenizer()
-    images = [Image.new("RGB", size) for size in [(28, 14), (14, 14)][:count]]
+    images = [Image.new("RGB", size) for size in [(56, 28), (28, 28)][:count]]
 
-    def make_image_prompt(width, height):
-        return f"<|media_begin|>image {width}x{height}<|media_content|><|media_pad|><|media_end|>"
+    def make_image_prompt(width, height, pads=1):
+        return f"<|media_begin|>image {width}x{height}<|media_content|>" + "<|media_pad|>" * pads + "<|media_end|>"
+
+    def feature_count(media):
+        return namespace["navit_resize_image"](*media["image"].size, 14, 2, 64, 8, None)["num_tokens"]
 
     def get_items(*args):
         assert images, "Text-only prompts must not query image items"
@@ -157,22 +169,29 @@ def test_native_prompt_updates_accept_raw_or_checkpoint_media_blocks(native, pro
         get_hf_config=lambda: SimpleNamespace(image_placeholder="<|kimi_image_placeholder|>"),
         get_tokenizer=lambda: tokenizer,
         image_processor=SimpleNamespace(make_image_prompt=make_image_prompt),
-        media_tokens_calculator=lambda media: media["image"].width // 14 * (media["image"].height // 14),
+        media_tokens_calculator=feature_count,
     )
     updates = processor._get_prompt_updates(items, {}, None)
     prompt = "".join(
-        "<|kimi_image_placeholder|>" if prompt_format == "native" else make_image_prompt(*image.size)
-        for image in images
+        "<|kimi_image_placeholder|>"
+        if prompt_format == "native"
+        else make_image_prompt(*image.size, pads=(2, 1)[index] if prompt_format == "expanded" else 1)
+        for index, image in enumerate(images)
     )
     original = tokenizer.encode(prompt + " image", add_special_tokens=False)
     expected = [token for index in range(count) for token in updates[0].resolve(index).content.full] + [1]
-    result, matches = namespace["apply_token_matches"](
+    result, matches, placeholders = namespace["_apply_token_matches_with_placeholders"](
         original,
         {
             "image": [[update.resolve(index) for update in updates] for index in range(count)],
         },
     )
-    assert matches == {"image": [0 if prompt_format == "native" else 1] * count}
+    expected_matches = [0 if prompt_format == "native" else 1] * count
+    if prompt_format == "expanded":
+        expected_matches = [2, 1][:count]
+        assert result == original
+    assert matches == {"image": expected_matches}
+    assert [int(item.is_embed.sum()) for item in placeholders["image"]] == [2, 1][:count]
     assert result == expected
     assert result.count(processor.info.media_token_id) == (0, 2, 3)[count]
     assert original == tokenizer.encode(prompt + " image", add_special_tokens=False)
@@ -194,3 +213,29 @@ def test_native_renderer_and_generation_config_supply_eos_without_model_hook(nat
     assert params._all_stop_token_ids == {eos, 101}
     assert set(params.stop_token_ids) == ({100} if ignore_eos else {100, 101})
     assert getattr(params, "_eos_token_id", None) == (None if ignore_eos else eos)
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{}, {"images_kwargs": {}}, {"return_tensors": "pt", "truncation": False, "padding": False}]
+)
+def test_native_image_boundary_preserves_framework_kwargs(native, kwargs):
+    _, namespace = native
+    processor = namespace["AscendKimiK3MultiModalProcessor"]()
+    data = {"images": [Image.new("RGB", (56, 28))]}
+    result = processor._preprocess_hf_mm_data(data, kwargs)
+    assert result[0] is data and result[1] is kwargs
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"images_kwargs": {"size": {"width": 28, "height": 28}}},
+        {"size": {"width": 28, "height": 28}},
+        {"in_patch_limit": 16},
+    ],
+)
+def test_native_image_boundary_rejects_ignored_resize_overrides(native, kwargs):
+    _, namespace = native
+    processor = namespace["AscendKimiK3MultiModalProcessor"]()
+    with pytest.raises(TypeError, match="does not support image preprocessing overrides"):
+        processor._preprocess_hf_mm_data({"images": [Image.new("RGB", (56, 28))]}, kwargs)

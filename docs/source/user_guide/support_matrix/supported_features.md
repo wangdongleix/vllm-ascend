@@ -48,7 +48,18 @@ token order before expert load-balancing maps logical IDs to physical slots.
 
 The Kimi K3 multimodal processor accepts both the native image placeholder and
 media blocks emitted by the checkpoint's HF processor through vLLM's prompt
-updates. Images use the standard PIL `image` modality.
+updates. With the same default image configuration, an HF prompt already carrying
+one `media_pad` token per visual feature keeps its token IDs and sequence length;
+vLLM records the existing embedding slots without expanding the image again.
+Images use the standard PIL `image` modality.
+
+The vLLM 0.30 Kimi image wrapper does not forward per-request image resize
+options to the checkpoint image processor. Ascend rejects those grid-changing
+overrides, including nonempty `images_kwargs`, instead of silently ignoring them.
+Empty `images_kwargs` and ordinary tokenizer/framework options remain accepted.
+Per-call image resizing supported by a training processor does not imply support
+for that override in the rollout processor; rollout uses its checkpoint image
+configuration.
 
 [v1_user_guide]: https://docs.vllm.ai/en/latest/usage/v1_guide/
 [multimodal]: https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/Qwen-VL-Dense.html
