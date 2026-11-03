@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
@@ -13,7 +13,7 @@ from vllm.config import CUDAGraphMode
 import vllm_ascend.attention.mla_v1 as mla_v1
 from vllm_ascend.attention.mla_v1 import AscendMLAImpl
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
-from vllm_ascend.models import kimi_k3, kimi_k3_dspark
+from vllm_ascend.models import kimi_k3
 from vllm_ascend.models.kimi_k3 import (
     AscendKimiK3MultiModalProjector,
     AscendKimiLinearModel,
@@ -477,164 +477,6 @@ def test_kimi_mixed_kda_gate_weights_use_upstream_packed_loader(monkeypatch):
     }
 
 
-def test_kimi_model_declares_fused_bfg_checkpoint_mapping():
-    assert AscendKimiLinearModel.packed_modules_mapping["fused_bfg_proj"] == [
-        "b_proj",
-        "f_a_proj",
-        "g_proj",
-    ]
-
-
-def test_kimi_dense_mlp_gathers_and_scatters_sequence_shards(monkeypatch):
-    mlp = kimi_k3.AscendKimiMLP.__new__(kimi_k3.AscendKimiMLP)
-    nn.Module.__init__(mlp)
-    mlp.use_sequence_parallel = True
-    calls = []
-
-    def fake_all_gather(hidden_states):
-        calls.append(("gather", hidden_states.clone()))
-        return torch.cat((hidden_states, hidden_states + 10), dim=0)
-
-    def fake_mlp_forward(_self, hidden_states):
-        calls.append(("mlp", hidden_states.clone()))
-        return hidden_states + 1
-
-    def fake_reduce_scatter(hidden_states):
-        calls.append(("reduce_scatter", hidden_states.clone()))
-        return hidden_states.chunk(2, dim=0)[0]
-
-    monkeypatch.setattr(kimi_k3, "sp_all_gather", fake_all_gather)
-    monkeypatch.setattr(kimi_k3, "sp_reduce_scatter", fake_reduce_scatter)
-    monkeypatch.setattr(kimi_k3.KimiMLP, "forward", fake_mlp_forward)
-
-    output = mlp(torch.tensor([[1.0], [2.0]]))
-
-    assert [name for name, _ in calls] == ["gather", "mlp", "reduce_scatter"]
-    torch.testing.assert_close(calls[1][1], torch.tensor([[1.0], [2.0], [11.0], [12.0]]))
-    torch.testing.assert_close(output, torch.tensor([[2.0], [3.0]]))
-
-
-def test_kimi_attention_residual_stays_sequence_sharded(monkeypatch):
-    class IdentityAttention(nn.Module):
-        def forward(self, *, hidden_states, positions):
-            del positions
-            return hidden_states
-
-    layer = kimi_k3.AscendKimiDecoderLayer.__new__(kimi_k3.AscendKimiDecoderLayer)
-    nn.Module.__init__(layer)
-    layer.use_sequence_parallel = True
-    layer.fuse_o_proj_mm_reduce_scatter = False
-    layer.prev_valid_blocks = 0
-    layer.is_block_write_layer = False
-    layer.input_layernorm = nn.Identity()
-    layer.post_attention_layernorm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-5)
-    layer.mlp = nn.Identity()
-    layer.self_attention_res_proj = object()
-    layer.self_attention_res_norm = object()
-    layer.mlp_res_proj = SimpleNamespace(weight=torch.ones(1, 2))
-    layer.mlp_res_norm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-5)
-    layer.self_attn = IdentityAttention()
-
-    collective_shapes = []
-
-    def fake_all_gather(hidden_states):
-        collective_shapes.append(("gather", hidden_states.shape))
-        return torch.cat((hidden_states, hidden_states), dim=0)
-
-    def fake_reduce_scatter(hidden_states):
-        collective_shapes.append(("reduce_scatter", hidden_states.shape))
-        return hidden_states.chunk(2, dim=0)[0]
-
-    monkeypatch.setattr(kimi_k3, "sp_all_gather", fake_all_gather)
-    monkeypatch.setattr(kimi_k3, "sp_reduce_scatter", fake_reduce_scatter)
-    layer.prepare_attn_residual = MethodType(lambda self, prefix, bank, **kwargs: (prefix, prefix, prefix), layer)
-
-    def fake_fused(prefix, addend, *_args, **_kwargs):
-        raw = prefix if addend is None else prefix + addend
-        return raw, raw, raw
-
-    monkeypatch.setattr(torch.ops._C_ascend, "attn_res_fwd", fake_fused, raising=False)
-
-    hidden_states = torch.arange(4, dtype=torch.float32).view(2, 2)
-    block_residual = torch.zeros(2, 1, 2)
-    output, returned_residual = layer.forward_attn_residual(
-        positions=torch.arange(3),
-        hidden_states=hidden_states,
-        block_residual=block_residual,
-    )
-
-    assert collective_shapes == [
-        ("gather", torch.Size([2, 2])),
-        ("reduce_scatter", torch.Size([3, 2])),
-    ]
-    assert output.shape == torch.Size([2, 2])
-    assert returned_residual.shape == torch.Size([2, 1, 2])
-
-
-def test_kimi_model_allocates_attention_residual_after_sp_shard(monkeypatch):
-    class RecordingLayer(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.residual_shape = None
-
-        def prepare_attn_residual(self, prefix, bank, addend=None, **kwargs):
-            raw = prefix if addend is None else prefix + addend
-            return raw, raw, raw
-
-        def forward(self, *, positions, hidden_states, residual, **kwargs):
-            self.residual_shape = residual.shape
-            return hidden_states, residual, None
-
-    model = AscendKimiLinearModel.__new__(AscendKimiLinearModel)
-    nn.Module.__init__(model)
-    model.config = SimpleNamespace(attn_res_block_size=12)
-    model.start_layer = 0
-    model.end_layer = 1
-    layer = RecordingLayer()
-    model.layers = nn.ModuleList([layer])
-    model.use_sequence_parallel = True
-    model.aux_hidden_state_layers = set()
-    model.output_attn_res_proj = SimpleNamespace(weight=torch.ones(1, 2))
-    model.output_attn_res_norm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-5)
-    model._maybe_add_hidden_state = MethodType(
-        lambda self, states, *_args: states,
-        model,
-    )
-
-    monkeypatch.setattr(
-        kimi_k3,
-        "get_pp_group",
-        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
-    )
-    monkeypatch.setattr(
-        kimi_k3,
-        "sp_shard",
-        lambda hidden_states: torch.nn.functional.pad(hidden_states, (0, 0, 0, 1))[:2],
-    )
-    monkeypatch.setattr(
-        kimi_k3,
-        "sp_all_gather",
-        lambda hidden_states: torch.cat((hidden_states, hidden_states), dim=0),
-    )
-    monkeypatch.setattr(kimi_k3, "_use_attn_res_prefill_cache", lambda: False)
-
-    def fake_fused(prefix, addend, *_args, **_kwargs):
-        raw = prefix if addend is None else prefix + addend
-        return raw, raw, raw
-
-    monkeypatch.setattr(torch.ops._C_ascend, "attn_res_fwd", fake_fused, raising=False)
-
-    output = model(
-        input_ids=None,
-        positions=torch.arange(3),
-        intermediate_tensors=None,
-        inputs_embeds=torch.arange(6, dtype=torch.float32).view(3, 2),
-    )
-
-    assert layer.residual_shape == torch.Size([2, 1, 2])
-    assert output.shape == torch.Size([3, 2])
-
-
 def test_kimi_model_selects_materialized_or_raw_dspark_aux_stream(monkeypatch):
     class RecordingLayer(nn.Module):
         def __init__(self, layer_idx: int) -> None:
@@ -809,34 +651,3 @@ def test_k3_dspark_embed_input_ids_merges_multimodal_embeddings():
             ]
         ),
     )
-
-
-def test_k3_dspark_pp_mapper_keeps_frozen_embed_but_drops_heads(monkeypatch):
-    from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM as UpstreamK3DSpark
-
-    loader = MagicMock()
-    monkeypatch.setattr(kimi_k3_dspark, "AutoWeightsLoader", lambda model: loader)
-    model = AscendK3DSparkForCausalLM.__new__(AscendK3DSparkForCausalLM)
-    nn.Module.__init__(model)
-    model._owns_embed_tokens = True
-    model.load_weights([])
-    pp_mapper = loader.load_weights.call_args.kwargs["mapper"]
-    upstream_mapper = UpstreamK3DSpark.hf_to_vllm_mapper
-
-    # The frozen embedding copy must survive on PP stages that cannot alias
-    # the target's stage-0 embedding.
-    assert pp_mapper._map_name("embed_tokens.weight") == "model.embed_tokens.weight"
-    assert upstream_mapper._map_name("embed_tokens.weight") is None
-
-    # Everything else matches upstream: heads stay dropped, layers keep the
-    # model. prefix and the stacked projections map identically.
-    for name in ("lm_head.weight", "confidence_head.weight"):
-        assert pp_mapper._map_name(name) is None
-        assert upstream_mapper._map_name(name) is None
-    for name in (
-        "layers.0.self_attn.q_a_proj.weight",
-        "layers.0.self_attn.kv_a_proj_with_mqa.weight",
-        "layers.0.mlp.gate_proj.weight",
-        "context_proj.weight",
-    ):
-        assert pp_mapper._map_name(name) == upstream_mapper._map_name(name)

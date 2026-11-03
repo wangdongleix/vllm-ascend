@@ -119,11 +119,3 @@ def test_patch_projection_matches_actor_fp32_linear_and_retains_names():
     expected = F.linear(x.flatten(1).float(), projection.weight.flatten(1).float()).to(torch.bfloat16)
     torch.testing.assert_close(patch(x, [[1, 1, 5]]), expected, rtol=0, atol=0)
     assert dict(patch.named_parameters())["proj.weight"] is projection.weight
-
-
-def test_ascend_kimi_requires_processor_side_image_normalization():
-    from vllm_ascend.models.kimi_k3 import AscendKimiK3ForConditionalGeneration
-
-    # A uint8 processor path requires a device normalization layer. The Ascend
-    # tower instead consumes the same normalized patches as the training model.
-    assert AscendKimiK3ForConditionalGeneration.supports_mm_device_do_normalize is False

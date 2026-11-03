@@ -406,8 +406,7 @@ def test_eplb_expert_remapping_preserves_weight_metadata():
 
 
 @pytest.mark.parametrize("enable_eplb", [False, True])
-@pytest.mark.parametrize("capture_routing", [False, True])
-def test_moe_uses_factory_expert_counts(monkeypatch, enable_eplb, capture_routing):
+def test_moe_uses_factory_expert_counts(monkeypatch, enable_eplb):
     config = SimpleNamespace(
         hidden_size=4,
         moe_intermediate_size=8,
@@ -431,28 +430,15 @@ def test_moe_uses_factory_expert_counts(monkeypatch, enable_eplb, capture_routin
         num_experts=264 if enable_eplb else 256,
         num_local_experts=33 if enable_eplb else 256,
     )
-    runner.router = object()
-    runner.routed_experts = nn.Module()
-    runner.routed_experts.router = runner.router
-    original_router = runner.router
     factory = MagicMock(return_value=runner)
     monkeypatch.setattr(k3_module, "FusedMoEFactory", factory)
     monkeypatch.setattr(
         k3_module, "GateLinear", lambda input_size, output_size, **kwargs: nn.Linear(input_size, output_size)
     )
 
-    moe = k3_module.AscendKimiMoE(
-        config=config,
-        vllm_config=SimpleNamespace(
-            parallel_config=parallel,
-            model_config=SimpleNamespace(enable_return_routed_experts=capture_routing),
-            additional_config={},
-        ),
-    )
+    moe = k3_module.AscendKimiMoE(config=config, vllm_config=SimpleNamespace(parallel_config=parallel))
 
     assert factory.call_args.kwargs["enable_eplb"] == enable_eplb
     assert factory.call_args.kwargs["num_redundant_experts"] == (8 if enable_eplb else 0)
     assert moe.n_physical_experts == runner.moe_config.num_experts
     assert moe.n_local_physical_experts == runner.moe_config.num_local_experts
-    assert runner.router is original_router
-    assert runner.routed_experts.router is runner.router

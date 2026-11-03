@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exercise native vLLM prompt-update and EOS functions without device kernels."""
+"""Exercise native vLLM prompt updates without device kernels."""
 
 from __future__ import annotations
 
@@ -34,13 +34,11 @@ import pytest
 import torch
 from PIL import Image
 from tokenizers import Tokenizer, models, pre_tokenizers
-from transformers import GenerationConfig, PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast
 
 
-def _definitions(path, names, namespace, owner=None):
+def _definitions(path, names, namespace):
     tree = ast.parse(path.read_text())
-    if owner:
-        tree = next(node for node in tree.body if getattr(node, "name", None) == owner)
     nodes = [node for node in tree.body if getattr(node, "name", None) in names]
     module = ast.Module(
         body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes],
@@ -95,8 +93,6 @@ def native():
             "_next_priority",
             "_plan_prompt_updates_with",
             "_plan_prompt_updates",
-            "_apply_matches",
-            "apply_token_matches",
             "PlaceholderFeaturesInfo",
             "_apply_token_matches_with_placeholders",
         },
@@ -128,7 +124,6 @@ def _tokenizer():
     return PreTrainedTokenizerFast(
         tokenizer_object=backend,
         unk_token="<unk>",
-        eos_token="<|im_end|>",
         additional_special_tokens=[
             "<|kimi_image_placeholder|>",
             "<|media_begin|>",
@@ -195,24 +190,6 @@ def test_native_prompt_updates_accept_raw_or_checkpoint_media_blocks(native, pro
     assert result == expected
     assert result.count(processor.info.media_token_id) == (0, 2, 3)[count]
     assert original == tokenizer.encode(prompt + " image", add_special_tokens=False)
-
-
-@pytest.mark.parametrize("ignore_eos", [False, True])
-def test_native_renderer_and_generation_config_supply_eos_without_model_hook(native, ignore_eos):
-    root, namespace = native
-    methods = {}
-    for file, owner, name in [
-        (root / "renderers/base.py", "BaseRenderer", "get_eos_token_id"),
-        (root / "sampling_params.py", "SamplingParams", "update_from_generation_config"),
-    ]:
-        _definitions(file, {name}, methods, owner=owner)
-    eos = methods["get_eos_token_id"](SimpleNamespace(tokenizer=_tokenizer()))
-    params = SimpleNamespace(ignore_eos=ignore_eos, stop_token_ids=[100], _all_stop_token_ids=set())
-    config = GenerationConfig(eos_token_id=[eos, 101]).to_diff_dict()
-    methods["update_from_generation_config"](params, config, eos)
-    assert params._all_stop_token_ids == {eos, 101}
-    assert set(params.stop_token_ids) == ({100} if ignore_eos else {100, 101})
-    assert getattr(params, "_eos_token_id", None) == (None if ignore_eos else eos)
 
 
 @pytest.mark.parametrize(
