@@ -36,8 +36,10 @@ from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import GenerationConfig, PreTrainedTokenizerFast
 
 
-def _definitions(path, names, namespace):
+def _definitions(path, names, namespace, owner=None):
     tree = ast.parse(path.read_text())
+    if owner:
+        tree = next(node for node in tree.body if getattr(node, "name", None) == owner)
     nodes = [node for node in tree.body if getattr(node, "name", None) in names]
     module = ast.Module(
         body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes],
@@ -131,8 +133,7 @@ def _tokenizer():
     )
 
 
-@pytest.mark.parametrize("prompt_format", ["native", "hf"])
-@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("count,prompt_format", [(0, "native"), (1, "native"), (1, "hf"), (2, "native"), (2, "hf")])
 def test_native_prompt_updates_accept_raw_or_checkpoint_media_blocks(native, prompt_format, count):
     _, namespace = native
     tokenizer = _tokenizer()
@@ -141,12 +142,14 @@ def test_native_prompt_updates_accept_raw_or_checkpoint_media_blocks(native, pro
     def make_image_prompt(width, height):
         return f"<|media_begin|>image {width}x{height}<|media_content|><|media_pad|><|media_end|>"
 
-    items = SimpleNamespace(
-        get_items=lambda *args: SimpleNamespace(
+    def get_items(*args):
+        assert images, "Text-only prompts must not query image items"
+        return SimpleNamespace(
             get=lambda index: images[index],
             get_image_size=lambda index: images[index].size,
         )
-    )
+
+    items = SimpleNamespace(get_items=get_items)
     processor = namespace["AscendKimiK3MultiModalProcessor"]()
     processor.info = SimpleNamespace(
         media_token_id=tokenizer.convert_tokens_to_ids("<|media_pad|>"),
@@ -161,8 +164,8 @@ def test_native_prompt_updates_accept_raw_or_checkpoint_media_blocks(native, pro
         "<|kimi_image_placeholder|>" if prompt_format == "native" else make_image_prompt(*image.size)
         for image in images
     )
-    original = tokenizer.encode(prompt, add_special_tokens=False)
-    expected = [token for index in range(count) for token in updates[0].resolve(index).content.full]
+    original = tokenizer.encode(prompt + " image", add_special_tokens=False)
+    expected = [token for index in range(count) for token in updates[0].resolve(index).content.full] + [1]
     result, matches = namespace["apply_token_matches"](
         original,
         {
@@ -171,27 +174,8 @@ def test_native_prompt_updates_accept_raw_or_checkpoint_media_blocks(native, pro
     )
     assert matches == {"image": [0 if prompt_format == "native" else 1] * count}
     assert result == expected
-    assert result.count(processor.info.media_token_id) == (2 if count == 1 else 3)
-    assert original == tokenizer.encode(prompt, add_special_tokens=False)
-
-
-def test_text_only_prompt_does_not_require_image_items(native):
-    _, namespace = native
-
-    def no_images(*args):
-        raise AssertionError("Text-only prompts must not query image items")
-
-    processor = namespace["AscendKimiK3MultiModalProcessor"]()
-    processor.info = SimpleNamespace(
-        media_token_id=1,
-        media_token="<|media_pad|>",
-        get_hf_config=lambda: SimpleNamespace(image_placeholder="<|kimi_image_placeholder|>"),
-        get_tokenizer=_tokenizer,
-    )
-    updates = processor._get_prompt_updates(SimpleNamespace(get_items=no_images), {}, None)
-    assert len(updates) == 2
-    result, matches = namespace["apply_token_matches"]([7, 8], {"image": []})
-    assert result == [7, 8] and matches == {"image": []}
+    assert result.count(processor.info.media_token_id) == (0, 2, 3)[count]
+    assert original == tokenizer.encode(prompt + " image", add_special_tokens=False)
 
 
 @pytest.mark.parametrize("ignore_eos", [False, True])
@@ -202,14 +186,7 @@ def test_native_renderer_and_generation_config_supply_eos_without_model_hook(nat
         (root / "renderers/base.py", "BaseRenderer", "get_eos_token_id"),
         (root / "sampling_params.py", "SamplingParams", "update_from_generation_config"),
     ]:
-        tree = ast.parse(file.read_text())
-        cls = next(node for node in tree.body if getattr(node, "name", None) == owner)
-        method = next(node for node in cls.body if getattr(node, "name", None) == name)
-        module = ast.Module(
-            body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), method],
-            type_ignores=[],
-        )
-        exec(compile(ast.fix_missing_locations(module), str(file), "exec"), methods)
+        _definitions(file, {name}, methods, owner=owner)
     eos = methods["get_eos_token_id"](SimpleNamespace(tokenizer=_tokenizer()))
     params = SimpleNamespace(ignore_eos=ignore_eos, stop_token_ids=[100], _all_stop_token_ids=set())
     config = GenerationConfig(eos_token_id=[eos, 101]).to_diff_dict()

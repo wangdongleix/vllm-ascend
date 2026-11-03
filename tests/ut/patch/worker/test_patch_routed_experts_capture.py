@@ -282,34 +282,56 @@ class TestRoutedExpertsCapturerCapture:
         assert torch.all(capturer.device_buffer == 0)
 
 
-@pytest.mark.parametrize("comm_name", ["ALLTOALL", "MC2", "FUSED_MC2", "ALLGATHER"])
-@pytest.mark.parametrize("tp_size", [2, 8])
-@pytest.mark.parametrize("raw_rows", [1, 7, 9])
-def test_single_dp_preserves_standard_ids_for_each_dispatch(comm_name, tp_size, raw_rows):
+@pytest.mark.parametrize(
+    "comm_name,tp_size,raw_rows,flashcomm",
+    [
+        (comm, tp, rows, False)
+        for comm in ("ALLTOALL", "MC2", "FUSED_MC2", "ALLGATHER")
+        for tp in (2, 8)
+        for rows in (1, 7, 9)
+    ]
+    + [("ALLTOALL", 8, rows, True) for rows in (1, 7, 466)],
+)
+def test_tp_capture_preserves_ids_and_padding_for_each_dispatch(comm_name, tp_size, raw_rows, flashcomm):
     from vllm_ascend.ascend_forward_context import MoECommType
     from vllm_ascend.patch.worker import patch_routed_experts_capture as target
 
     split = comm_name != "ALLGATHER"
-    padded_rows = max(raw_rows, tp_size) if comm_name == "ALLTOALL" else 16
-    ids = torch.arange((padded_rows if split else raw_rows) * 2, dtype=torch.int32).reshape(-1, 2) + 256
+    if flashcomm:
+        padded_rows = (raw_rows + tp_size - 1) // tp_size * tp_size
+    elif comm_name == "ALLTOALL":
+        padded_rows = max(raw_rows, tp_size)
+    else:
+        padded_rows = 16
+    topk = 8 if flashcomm else 2
+    ids = torch.arange((padded_rows if split else raw_rows) * topk, dtype=torch.int32).reshape(-1, topk) % 640 + 256
     shards = torch.tensor_split(ids, tp_size) if split else [ids] * tp_size
+    context = SimpleNamespace(
+        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor([raw_rows])) if flashcomm else None
+    )
     extra = SimpleNamespace(
         moe_comm_type=getattr(MoECommType, comm_name),
-        moe_comm_method=SimpleNamespace(prepare_finalize=SimpleNamespace(num_tokens=raw_rows)),
+        moe_comm_method=SimpleNamespace(
+            prepare_finalize=SimpleNamespace(
+                num_tokens=padded_rows // tp_size if flashcomm else raw_rows, replace_allreduce=flashcomm
+            )
+        ),
         padded_num_tokens=padded_rows,
     )
     for rank in range(tp_size):
         capturer = SimpleNamespace(
-            device_buffer=torch.zeros(ids.shape[0], 1, 2, dtype=torch.int32), dp_rank=0, tp_size=tp_size
+            device_buffer=torch.full((ids.shape[0], 1, topk), -1, dtype=torch.int32), dp_rank=0, tp_size=tp_size
         )
 
         def all_gather(outputs, source, group, rank=rank):
             torch.testing.assert_close(source, shards[rank])
+            if flashcomm:
+                assert all(output.shape == source.shape for output in outputs)
             for output, shard in zip(outputs, shards, strict=True):
                 output.copy_(shard)
 
         with (
-            patch.object(target, "get_forward_context", return_value=SimpleNamespace(dp_metadata=None)),
+            patch.object(target, "get_forward_context", return_value=context),
             patch.object(target, "_EXTRA_CTX", extra),
             patch.object(target, "get_tp_group", return_value=SimpleNamespace(device_group=object())),
             patch.object(target.dist, "all_gather", side_effect=all_gather) as gather,
@@ -317,49 +339,8 @@ def test_single_dp_preserves_standard_ids_for_each_dispatch(comm_name, tp_size, 
             target.capture(capturer, 0, shards[rank])
         assert gather.call_count == int(split)
         torch.testing.assert_close(capturer.device_buffer[:raw_rows, 0], ids[:raw_rows])
-
-
-@pytest.mark.parametrize("raw_rows", [1, 7, 466])
-@pytest.mark.parametrize("tp_rank", range(8))
-def test_flashcomm_r3_capture_uses_padded_layout_with_dp_metadata(raw_rows, tp_rank):
-    from vllm_ascend.ascend_forward_context import MoECommType
-    from vllm_ascend.patch.worker import patch_routed_experts_capture as target
-
-    tp_size, topk = 8, 8
-    local_rows = (raw_rows + tp_size - 1) // tp_size
-    padded_rows = local_rows * tp_size
-    ids = torch.arange(padded_rows * topk, dtype=torch.int32).reshape(padded_rows, topk) % 16
-    capturer = SimpleNamespace(
-        dp_rank=0,
-        tp_size=tp_size,
-        device_buffer=torch.full((padded_rows, 1, topk), -1, dtype=torch.int32),
-    )
-    context = SimpleNamespace(dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor([raw_rows])))
-    extra = SimpleNamespace(
-        moe_comm_type=MoECommType.ALLTOALL,
-        moe_comm_method=SimpleNamespace(
-            prepare_finalize=SimpleNamespace(replace_allreduce=True, num_tokens=local_rows)
-        ),
-        padded_num_tokens=padded_rows,
-    )
-    begin = tp_rank * local_rows
-
-    def all_gather(outputs, source, group):
-        assert all(output.shape == source.shape for output in outputs)
-        torch.testing.assert_close(source, ids[begin : begin + local_rows])
-        for rank, output in enumerate(outputs):
-            output.copy_(ids[rank * local_rows : (rank + 1) * local_rows])
-
-    with (
-        patch.object(target, "get_forward_context", return_value=context),
-        patch.object(target, "_EXTRA_CTX", extra),
-        patch.object(target, "get_tp_group", return_value=SimpleNamespace(device_group=object())),
-        patch.object(target.dist, "all_gather", side_effect=all_gather) as gather,
-    ):
-        target.capture(capturer, 0, ids[begin : begin + local_rows])
-    gather.assert_called_once()
-    torch.testing.assert_close(capturer.device_buffer[:raw_rows, 0], ids[:raw_rows])
-    assert (capturer.device_buffer[raw_rows:] == -1).all()
+        if flashcomm:
+            assert (capturer.device_buffer[raw_rows:] == -1).all()
 
 
 if __name__ == "__main__":

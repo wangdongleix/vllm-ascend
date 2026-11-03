@@ -15,7 +15,6 @@ from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_ascend.models import kimi_k3 as k3_module
 from vllm_ascend.models import kimi_k3_mtp as mtp_module
-from vllm_ascend.ops.fused_moe.router.grouped_topk_router import AscendGroupedTopKRouter
 from vllm_ascend.patch.platform import patch_eplb
 
 
@@ -432,14 +431,7 @@ def test_moe_uses_factory_expert_counts(monkeypatch, enable_eplb, capture_routin
         num_experts=264 if enable_eplb else 256,
         num_local_experts=33 if enable_eplb else 256,
     )
-    runner.router = AscendGroupedTopKRouter(
-        top_k=2,
-        global_num_experts=256,
-        num_expert_group=1,
-        topk_group=1,
-        use_grouped_topk=False,
-        scoring_func="sigmoid",
-    )
+    runner.router = object()
     runner.routed_experts = nn.Module()
     runner.routed_experts.router = runner.router
     original_router = runner.router
