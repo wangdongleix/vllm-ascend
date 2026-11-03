@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi K3 model adapters for vLLM 0.27 on Ascend.
+"""Kimi K3 integration with vLLM 0.30 on Ascend.
 
 vLLM owns Kimi's configuration, multimodal processor, weight mappings, and
 model-level forward contract.  This module composes those upstream pieces with
@@ -83,6 +83,8 @@ from vllm.models.kimi_k3.nvidia.model import (
     KimiLinearModel as UpstreamPackedKimiLinearModel,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.parse import ImageProcessorItems
+from vllm.multimodal.processing import PromptReplacement, cached_encode
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -1332,8 +1334,21 @@ class KimiTrainingPatchEmbed(nn.Module):
         return output + pos_embeds if pos_embeds is not None else self.pos_emb(output, grid_thws)
 
 
+class AscendKimiK3MultiModalProcessor(KimiK3MultiModalProcessor):
+    def _get_prompt_updates(self, mm_items, hf_processor_mm_kwargs, out_mm_kwargs):
+        (update,) = super()._get_prompt_updates(mm_items, hf_processor_mm_kwargs, out_mm_kwargs)
+
+        def hf_target(item_idx):
+            images = mm_items.get_items("image", ImageProcessorItems)
+            prompt = self.info.image_processor.make_image_prompt(*images.get_image_size(item_idx))
+            return cached_encode(self.info.get_tokenizer(), prompt, add_special_tokens=False)
+
+        # Accept checkpoint-processed media text through the same native update.
+        return [update, PromptReplacement(modality="image", target=hf_target, replacement=update.content)]
+
+
 @MULTIMODAL_REGISTRY.register_processor(
-    KimiK3MultiModalProcessor,
+    AscendKimiK3MultiModalProcessor,
     info=KimiK3ProcessingInfo,
     dummy_inputs=KimiK3DummyInputsBuilder,
 )

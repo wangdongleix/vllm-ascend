@@ -46,6 +46,10 @@ With `enable_return_routed_experts=True`, routing replay uses the upstream
 its router weights from its own logits. TP/DP capture preserves the complete
 token order before expert load-balancing maps logical IDs to physical slots.
 
+The Kimi K3 multimodal processor accepts both the native image placeholder and
+media blocks emitted by the checkpoint's HF processor through vLLM's prompt
+updates. Images use the standard PIL `image` modality.
+
 [v1_user_guide]: https://docs.vllm.ai/en/latest/usage/v1_guide/
 [multimodal]: https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/Qwen-VL-Dense.html
 [guided_decoding]: https://github.com/vllm-project/vllm-ascend/issues/177
