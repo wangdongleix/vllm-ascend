@@ -93,6 +93,7 @@ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_
 from vllm_ascend.ops.fused_moe.router.kimi_training_router import KimiTrainingRouter
 from vllm_ascend.ops.kimi_kda import (
     AscendKimiK3DeltaAttention as AscendKimiK3DeltaAttentionBase,
+    _KimiTrainingOutputProjection,
 )
 from vllm_ascend.ops.linear_op import KimiOProjMMReduceScatterOp
 from vllm_ascend.quantization.methods.base import PreparedLinearInput
@@ -750,6 +751,9 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
         if vllm_config.lora_config is not None:
             return False
         o_proj = self.self_attn.o_proj
+        # Preserve the training projection's FP32 GEMM instead of BF16 fusion.
+        if isinstance(o_proj, _KimiTrainingOutputProjection):
+            return False
         if KimiOProjMMReduceScatterOp.unsupported_reason(o_proj) is not None:
             return False
         o_proj.custom_op = KimiOProjMMReduceScatterOp(o_proj)
@@ -1328,11 +1332,16 @@ class KimiTrainingPatchEmbed(nn.Module):
     def __init__(self, patch_embed: nn.Module) -> None:
         super().__init__()
         self.proj = patch_embed.proj
-        self.input_norm = patch_embed.input_norm
+        self.input_norm = getattr(patch_embed, "input_norm", None)
         self.pos_emb = patch_embed.pos_emb
 
     def forward(self, x, grid_thws, *, pos_embeds=None):
-        x = self.input_norm(x.flatten(1), self.proj.weight.dtype)
+        x = x.flatten(1)
+        if self.input_norm is None:
+            # vLLM 0.30 already normalizes pixels in the image processor.
+            x = x.to(self.proj.weight.dtype, copy=False)
+        else:
+            x = self.input_norm(x, self.proj.weight.dtype)
         with torch.autocast(device_type=x.device.type, enabled=False):
             bias = self.proj.bias.float() if self.proj.bias is not None else None
             output = F.linear(x.float(), self.proj.weight.flatten(1).float(), bias)

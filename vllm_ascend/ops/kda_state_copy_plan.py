@@ -99,6 +99,7 @@ class KDAStateCopyPlan:
     _scalars: tuple[int, int, int, int]
     _tiles: int
     _compiled: Mapping[tuple[torch.dtype, bool], _CompiledKernel]
+    _launch_constants: Mapping[tuple[torch.dtype, bool], tuple]
     _layer_name: str
 
     @classmethod
@@ -157,6 +158,12 @@ class KDAStateCopyPlan:
             # surfacing asynchronous compilation/launch errors during startup.
             torch.npu.synchronize()
         plan._compiled = MappingProxyType(compiled)
+        # Match the backend ABI once, as the fallback copy plan does below.
+        plan._launch_constants = MappingProxyType({
+            key: ((key[1], not key[1], DEFAULT_KDA_BLOCK_SIZE)
+                  if "constexpr" in kernel.src.signature.values() else ())
+            for key, kernel in compiled.items()
+        })
         return plan
 
     def seal(self) -> None:
@@ -198,17 +205,13 @@ class KDAStateCopyPlan:
         if any(t.data_ptr() % 16 for t in tensors[1:]):
             raise RuntimeError("unaligned normalized KDA buffer")
         with nullcontext() if torch.npu.current_device() == state.device.index else torch.npu.device(state.device):
-            # CompiledKernel.__getitem__ bypasses the Triton JIT argument binder.
-            # The Ascend launcher stub retains the complete bound signature,
-            # including tl.constexpr arguments. Therefore the direct launch must
-            # use the same 12-argument ordering as the preparation-time launch.
+            # CompiledKernel bypasses the JIT binder. Only pass constexpr slots
+            # when the prepared backend signature retains them.
             self._compiled[indices.dtype, to_cache][(indices.numel(), self._tiles, 1)](
                 *tensors,
                 *self._scalars,
                 0 if to_cache else 1,
-                to_cache,
-                not to_cache,
-                DEFAULT_KDA_BLOCK_SIZE,
+                *self._launch_constants[indices.dtype, to_cache],
             )
 
     def gather(self, state: torch.Tensor, indices: torch.Tensor, flags: torch.Tensor | None) -> torch.Tensor:

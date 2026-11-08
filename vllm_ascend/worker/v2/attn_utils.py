@@ -1258,21 +1258,21 @@ def _allocate_kv_cache(
         if hybrid_backing is not None:
             for layer_idx, layer_name in enumerate(shared_names):
                 layer_spec = layer_kv_cache_spec[layer_name]
-                layer_size = kv_cache_config.num_blocks * layer_spec.page_size_bytes
-                if (
-                    kv_cache_tensor.layer_stride != layer_size
-                    or kv_cache_tensor.block_stride != layer_spec.page_size_bytes
+                page_size = layer_spec.page_size_bytes
+                if kv_cache_tensor.block_stride < page_size:
+                    raise ValueError("Hybrid KV cache block stride is smaller than a layer page.")
+                if (kv_cache_tensor.block_stride == page_size
+                        and kv_cache_tensor.layer_stride != kv_cache_config.num_blocks * page_size):
+                    raise ValueError("Contiguous hybrid layers must occupy separate full-layer spans.")
+                if kv_cache_tensor.block_stride != page_size and not (
+                    vllm_config.model_config.hf_config.model_type == "kimi_k3"
+                    and isinstance(layer_spec, (MambaSpec, AscendMLAAttentionSpec))
                 ):
-                    raise ValueError(
-                        "Ascend hybrid KV cache requires contiguous per-layer "
-                        f"views, but {layer_name} has layer_stride="
-                        f"{kv_cache_tensor.layer_stride}, block_stride="
-                        f"{kv_cache_tensor.block_stride}, page_size="
-                        f"{layer_spec.page_size_bytes}."
-                    )
+                    raise ValueError("Packed hybrid cache currently supports Kimi Mamba and MLA layers only.")
+                layer_size = (kv_cache_config.num_blocks - 1) * kv_cache_tensor.block_stride + page_size
                 start = kv_cache_tensor.offset + layer_idx * kv_cache_tensor.layer_stride
                 end = start + layer_size
-                if end > hybrid_backing.numel():
+                if start < 0 or end > hybrid_backing.numel():
                     raise ValueError(f"Hybrid KV cache view for {layer_name} exceeds the backing allocation.")
                 kv_cache_raw_tensors[layer_name] = hybrid_backing[start:end]
             continue
@@ -1521,6 +1521,60 @@ def _reshape_mamba_kv_cache(
     )
 
 
+def _reshape_packed_hybrid_cache(raw_cache, spec, num_blocks, block_stride, shapes, dtypes):
+    """Keep component payloads inside each layer's page in a block-major pool."""
+    if raw_cache.dtype != torch.int8 or not raw_cache.is_contiguous():
+        raise ValueError("Packed hybrid cache requires a contiguous byte span.")
+    if num_blocks <= 0 or block_stride < spec.page_size_bytes:
+        raise ValueError("Invalid packed hybrid block geometry.")
+    if len(shapes) != len(dtypes):
+        raise ValueError("Packed hybrid components have mismatched shapes and dtypes.")
+    offset = 0
+    views = []
+    for shape, dtype in zip(shapes, dtypes):
+        element_size = get_dtype_size(dtype)
+        component_size = math.prod(shape) * element_size
+        if (raw_cache.storage_offset() + offset) % element_size or block_stride % element_size:
+            raise ValueError("Packed hybrid component is not dtype aligned.")
+        if offset + component_size > spec.page_size_bytes:
+            raise ValueError("Packed hybrid components exceed their layer page.")
+        if (num_blocks - 1) * block_stride + offset + component_size > raw_cache.numel():
+            raise ValueError("Packed hybrid component exceeds its raw span.")
+        views.append(make_page_strided_cache_view(
+            raw_cache, (num_blocks, *shape), dtype, block_stride, offset
+        ))
+        offset += component_size
+    return views
+
+
+def _packed_mla_kernel_span(raw_cache, spec, descriptor, layer_index, num_blocks, kernel_block_size):
+    """Interleave MLA layers per kernel subblock inside each owned manager block.
+
+    Cache groups exclusively own manager block IDs. Reordering bytes inside
+    one such block preserves group isolation while giving kernels one uniform
+    leading stride. Transfer connectors must retain the planner's byte layout.
+    """
+    if kernel_block_size <= 0 or spec.block_size % kernel_block_size:
+        raise ValueError("MLA manager blocks must divide into whole kernel blocks.")
+    ratio = spec.block_size // kernel_block_size
+    # This transformation is valid only for a complete uniform MLA block.
+    layers = get_kv_cache_tensor_layers(descriptor)
+    if (descriptor.offset != 0 or descriptor.layer_stride != spec.page_size_bytes
+            or descriptor.block_stride != len(layers) * spec.page_size_bytes
+            or spec.page_size_bytes % ratio or not 0 <= layer_index < len(layers)):
+        raise ValueError("MLA subblock packing requires a full uniform block-major descriptor.")
+    page_bytes = spec.page_size_bytes // ratio
+    stride = descriptor.block_stride // ratio
+    count = num_blocks * ratio
+    start = layer_index * page_bytes
+    span = (count - 1) * stride + page_bytes
+    if start + span > min(descriptor.size, raw_cache.untyped_storage().nbytes()):
+        raise ValueError("MLA kernel subblocks exceed the shared backing allocation.")
+    raw = torch.as_strided(raw_cache, (span,), (1,), storage_offset=start)
+    kernel_spec = replace(spec, block_size=kernel_block_size, page_size_padded=page_bytes)
+    return raw, kernel_spec, count, stride
+
+
 def _reshape_kv_cache_v2(
     attn_groups: Sequence[AttentionGroup],
     kv_cache_raw_tensors: dict[str, Any],
@@ -1554,6 +1608,16 @@ def _reshape_kv_cache_v2(
         else {}
     )
 
+    packed_hybrid_strides = {}
+    if (getattr(vllm_config.model_config.hf_config, "model_type", None) == "kimi_k3"
+            and any(isinstance(spec, MambaSpec) for spec in layer_kv_cache_spec.values())):
+        packed_hybrid_strides = {
+            name: (descriptor, layer_index)
+            for descriptor in kv_cache_config.kv_cache_tensors
+            for layer_index, name in enumerate(get_kv_cache_tensor_layers(descriptor))
+            if descriptor.block_stride != layer_kv_cache_spec[name].page_size_bytes
+        }
+
     for group in attn_groups:
         if group.kv_cache_group_id >= len(kernel_block_sizes):
             continue
@@ -1576,6 +1640,41 @@ def _reshape_kv_cache_v2(
                 continue
 
             kv_cache_spec = layer_kv_cache_spec[layer_name]
+
+            if layer_name in packed_hybrid_strides:
+                descriptor, layer_index = packed_hybrid_strides[layer_name]
+                raw_cache = kv_cache_raw_tensors[layer_name]
+                view_spec = kv_cache_spec
+                num_blocks = kv_cache_config.num_blocks
+                block_stride = descriptor.block_stride
+                if isinstance(kv_cache_spec, MambaSpec):
+                    shapes, dtypes = kv_cache_spec.shapes, kv_cache_spec.dtypes
+                    is_flashmla = False
+                elif _uses_single_raw_mla_cache(vllm_config, layer_name, kv_cache_spec):
+                    if kv_cache_spec.block_size != kernel_block_size:
+                        if vllm_config.kv_transfer_config is not None:
+                            raise ValueError("Packed MLA subblocks do not support KV transfer.")
+                        if any(layer_kv_cache_spec[name] != kv_cache_spec
+                               for name in get_kv_cache_tensor_layers(descriptor)):
+                            raise ValueError("Packed MLA subblocks require uniform layer specs.")
+                        raw_cache, view_spec, num_blocks, block_stride = _packed_mla_kernel_span(
+                            raw_cache, kv_cache_spec, descriptor, layer_index, num_blocks, kernel_block_size
+                        )
+                    nope_dim, rope_dim = _get_attention_kv_cache_dims(layer_name, kv_cache_spec)
+                    impl = vllm_config.compilation_config.static_forward_context[layer_name].impl
+                    is_flashmla = impl.use_flashmla
+                    dims = [nope_dim + rope_dim] if is_flashmla else [nope_dim, rope_dim]
+                    shapes = [(kernel_block_size, kv_cache_spec.num_kv_heads, dim) for dim in dims]
+                    dtypes = [kv_cache_spec.dtype] * len(shapes)
+                else:
+                    raise ValueError(f"Unsupported packed hybrid writer for {layer_name}.")
+                views = _reshape_packed_hybrid_cache(
+                    raw_cache, view_spec, num_blocks, block_stride, shapes, dtypes,
+                )
+                kv_caches[layer_name] = views if isinstance(kv_cache_spec, MambaSpec) else (
+                    views[0] if is_flashmla else tuple(views)
+                )
+                continue
 
             if type(kv_cache_spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
                 raw_cache = kv_cache_raw_tensors[layer_name]

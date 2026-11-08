@@ -303,3 +303,33 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor, topk_weights: torch.Ten
 
 
 RoutedExpertsCapturer.capture = capture
+
+
+# The image's upstream binder only forwards IDs. Kimi full R3 also needs
+# the executed BF16 weights; bind those routers directly to the capturer.
+def _install_kimi_capture_binding():
+    import sys
+    from functools import partial
+
+    from vllm.model_executor.layers.fused_moe import routed_experts_capturer as capture_module
+
+    original_bind = capture_module.bind_routed_experts_capturer
+
+    def bind_with_kimi_weights(model, capturer):
+        from vllm.model_executor.layers.fused_moe.layer import MoERunner
+        from vllm_ascend.ops.fused_moe.router.kimi_training_router import KimiTrainingRouter
+
+        original_bind(model, capturer)
+        for module in model.modules():
+            if isinstance(module, MoERunner) and isinstance(module.router, KimiTrainingRouter):
+                module.router.set_capture_fn(partial(capturer.capture, module.layer_id))
+
+    capture_module.bind_routed_experts_capturer = bind_with_kimi_weights
+    # Both runner generations can import the binder before platform patches.
+    for name in ("vllm.v1.worker.gpu.model_runner", "vllm.v1.worker.gpu_model_runner"):
+        runner = sys.modules.get(name)
+        if runner is not None and getattr(runner, "bind_routed_experts_capturer", None) is original_bind:
+            runner.bind_routed_experts_capturer = bind_with_kimi_weights
+
+
+_install_kimi_capture_binding()

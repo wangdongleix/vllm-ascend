@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch_npu
+from vllm_ascend.ops.nz_reload import replace_nz_parameter
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import get_pcp_group
 from vllm.logger import logger
@@ -1458,11 +1459,10 @@ class AscendMLAImpl(MLAAttentionImpl):
             ("weight_dkv_kr", fused_weight[..., self.q_lora_rank :]),
             ("weight_uq_qr", weight_uq_qr),
         ):
-            replace_parameter(
+            replace_nz_parameter(
                 self,
                 name,
                 torch_npu.npu_format_cast(weight.contiguous(), ACL_FORMAT_FRACTAL_NZ),
-                prefer_copy=True,
             )
 
         if is_native and self.head_padding > 0:

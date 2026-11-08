@@ -213,11 +213,21 @@ class CaMemAllocator:
             handle = data.handle
             if data.tag in offload_tags:
                 size_in_bytes = handle[1]
-                cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+                try:
+                    cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+                except torch.OutOfMemoryError:
+                    # ACL's synchronous copy also accepts pageable host memory.
+                    # Preserve the weights when the driver's pinned allocation fails.
+                    logger.warning(
+                        "CaMem pinned backup allocation failed for %s bytes; using pageable host memory",
+                        size_in_bytes,
+                    )
+                    cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8, device="cpu")
                 cpu_ptr = cpu_backup_tensor.data_ptr()
                 ACL_MEMCPY_DEVICE_TO_HOST = 2
-                dest_max = cpu_ptr + size_in_bytes * 2
-                memcpy(cpu_ptr, dest_max, ptr, size_in_bytes, ACL_MEMCPY_DEVICE_TO_HOST)
+                ret = memcpy(cpu_ptr, size_in_bytes, ptr, size_in_bytes, ACL_MEMCPY_DEVICE_TO_HOST)
+                if ret != 0:
+                    raise RuntimeError(f"CaMem weight backup copy failed: ACL error {ret}")
                 data.cpu_backup_tensor = cpu_backup_tensor
             unmap_and_release(handle)
 
@@ -249,8 +259,9 @@ class CaMemAllocator:
                         size_in_bytes = cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
                         cpu_ptr = cpu_backup_tensor.data_ptr()
                         ACL_MEMCPY_HOST_TO_DEVICE = 1
-                        dest_max = ptr + size_in_bytes * 2
-                        memcpy(ptr, dest_max, cpu_ptr, size_in_bytes, ACL_MEMCPY_HOST_TO_DEVICE)
+                        ret = memcpy(ptr, size_in_bytes, cpu_ptr, size_in_bytes, ACL_MEMCPY_HOST_TO_DEVICE)
+                        if ret != 0:
+                            raise RuntimeError(f"CaMem weight restore copy failed: ACL error {ret}")
                         data.cpu_backup_tensor = None
 
     @contextmanager
